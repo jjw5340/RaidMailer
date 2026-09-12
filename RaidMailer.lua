@@ -29,6 +29,10 @@ local state = {
     awaitingResult = false,
     awaitingAttachment = false,
     attachmentVerifyAttempts = 0,
+    awaitingSplit = false,
+    splitVerifyAttempts = 0,
+    splitBag = nil,
+    splitSlot = nil,
     recipients = {},
     index = 0,
     sent = 0,
@@ -139,7 +143,29 @@ local function CountConfiguredItemsInBags()
     return total
 end
 
-local function FindConfiguredItemStack()
+local function FindConfiguredSingleton()
+    local itemID = GetConfiguredItemID()
+    if not itemID then return nil, nil, false end
+
+    local foundLocked = false
+
+    for bag = 0, 4 do
+        for slot = 1, GetNumSlots(bag) do
+            local info = GetContainerInfo(bag, slot)
+            if info and info.itemID == itemID and (info.stackCount or 0) == 1 then
+                if info.isLocked then
+                    foundLocked = true
+                else
+                    return bag, slot, false
+                end
+            end
+        end
+    end
+
+    return nil, nil, foundLocked
+end
+
+local function FindConfiguredLargeStack()
     local itemID = GetConfiguredItemID()
     if not itemID then return nil, nil, nil, false end
 
@@ -148,10 +174,10 @@ local function FindConfiguredItemStack()
     for bag = 0, 4 do
         for slot = 1, GetNumSlots(bag) do
             local info = GetContainerInfo(bag, slot)
-            if info and info.itemID == itemID then
+            if info and info.itemID == itemID and (info.stackCount or 0) > 1 then
                 if info.isLocked then
                     foundLocked = true
-                elseif (info.stackCount or 0) > 0 then
+                else
                     return bag, slot, info.stackCount, false
                 end
             end
@@ -159,6 +185,46 @@ local function FindConfiguredItemStack()
     end
 
     return nil, nil, nil, foundLocked
+end
+
+local function GetNumFreeSlots(bag)
+    if C_Container and C_Container.GetContainerNumFreeSlots then
+        return C_Container.GetContainerNumFreeSlots(bag)
+    end
+    return GetContainerNumFreeSlots(bag)
+end
+
+local function FindEmptyGeneralBagSlot()
+    for bag = 0, 4 do
+        local freeSlots, bagFamily = GetNumFreeSlots(bag)
+        -- Backpack and ordinary bags use bagFamily 0. Avoid specialty bags
+        -- because a generic configured item may not be allowed in them.
+        if (freeSlots or 0) > 0 and (bag == 0 or not bagFamily or bagFamily == 0) then
+            for slot = 1, GetNumSlots(bag) do
+                if not GetContainerInfo(bag, slot) then
+                    return bag, slot
+                end
+            end
+        end
+    end
+
+    return nil, nil
+end
+
+local function PickupContainerSlot(bag, slot)
+    if C_Container and C_Container.PickupContainerItem then
+        C_Container.PickupContainerItem(bag, slot)
+    else
+        PickupContainerItem(bag, slot)
+    end
+end
+
+local function SplitContainerStack(bag, slot, count)
+    if C_Container and C_Container.SplitContainerItem then
+        C_Container.SplitContainerItem(bag, slot, count)
+    else
+        SplitContainerItem(bag, slot, count)
+    end
 end
 
 local function HasExistingDraft()
@@ -251,8 +317,14 @@ local function StopRun(message, isError)
     state.awaitingResult = false
     state.awaitingAttachment = false
     state.attachmentVerifyAttempts = 0
+    state.awaitingSplit = false
+    state.splitVerifyAttempts = 0
+    state.splitBag = nil
+    state.splitSlot = nil
     state.currentRecipient = nil
     state.cancelRequested = false
+
+    ClearCursor()
 
     if MailFrame and MailFrame:IsShown() and ClearSendMail then
         ClearSendMail()
@@ -271,48 +343,31 @@ end
 
 local SendNext
 local VerifyAttachmentAndSend
+local VerifySplitAndAttach
 
-local function BeginAttachOneConfiguredItem(generation, retries)
-    if generation ~= state.generation or not state.running or state.awaitingResult or state.awaitingAttachment then
+local function AttachSingletonFromBag(generation, bag, slot)
+    if generation ~= state.generation or not state.running or state.awaitingResult or state.awaitingAttachment or state.awaitingSplit then
         return
     end
 
-    local bag, slot, stackCount, locked = FindConfiguredItemStack()
-    if not bag then
-        if locked and retries < 10 then
-            C_Timer.After(0.10, function()
-                BeginAttachOneConfiguredItem(generation, retries + 1)
-            end)
-            return
-        end
+    local info = GetContainerInfo(bag, slot)
+    if not info or info.itemID ~= GetConfiguredItemID() or (info.stackCount or 0) ~= 1 then
+        StopRun("Stopped: the prepared 1-item stack is no longer available.", true)
+        return
+    end
 
-        local itemName = GetConfiguredItemName()
-        if locked then
-            StopRun("Stopped: the remaining " .. itemName .. " is still locked in your bags.", true)
-        else
-            StopRun("Stopped: no accessible " .. itemName .. " remains in your bags.", true)
-        end
+    if info.isLocked then
+        C_Timer.After(0.05, function()
+            AttachSingletonFromBag(generation, bag, slot)
+        end)
         return
     end
 
     ClearCursor()
-
-    if stackCount == 1 then
-        if C_Container and C_Container.PickupContainerItem then
-            C_Container.PickupContainerItem(bag, slot)
-        else
-            PickupContainerItem(bag, slot)
-        end
-    else
-        if C_Container and C_Container.SplitContainerItem then
-            C_Container.SplitContainerItem(bag, slot, 1)
-        else
-            SplitContainerItem(bag, slot, 1)
-        end
-    end
+    PickupContainerSlot(bag, slot)
 
     if not CursorHasItem() then
-        StopRun("Stopped: could not pick up a " .. GetConfiguredItemName() .. " from your bags.", true)
+        StopRun("Stopped: could not pick up a single " .. GetConfiguredItemName() .. " from your bags.", true)
         return
     end
 
@@ -325,11 +380,115 @@ local function BeginAttachOneConfiguredItem(generation, retries)
 
     ClickSendMailItemButton(1)
 
-    -- Fallback for clients/addon combinations where the attachment event is
-    -- swallowed or delivered before our handler can schedule verification.
     C_Timer.After(0.05, function()
         VerifyAttachmentAndSend(generation)
     end)
+end
+
+local function PrepareOneItemInBag(generation, sourceBag, sourceSlot)
+    local emptyBag, emptySlot = FindEmptyGeneralBagSlot()
+    if not emptyBag then
+        StopRun("Stopped: RaidMailer needs one empty slot in the backpack or an ordinary bag to split " .. GetConfiguredItemName() .. ".", true)
+        return
+    end
+
+    ClearCursor()
+    SplitContainerStack(sourceBag, sourceSlot, 1)
+
+    if not CursorHasItem() then
+        StopRun("Stopped: could not split one " .. GetConfiguredItemName() .. " from the source stack.", true)
+        return
+    end
+
+    -- Put the split item into a real bag slot first.  The Anniversary client
+    -- can fail when a freshly split cursor stack is attached directly to mail.
+    PickupContainerSlot(emptyBag, emptySlot)
+
+    if CursorHasItem() then
+        ClearCursor()
+        StopRun("Stopped: could not place the split " .. GetConfiguredItemName() .. " into an empty bag slot.", true)
+        return
+    end
+
+    state.awaitingSplit = true
+    state.splitVerifyAttempts = 0
+    state.splitBag = emptyBag
+    state.splitSlot = emptySlot
+    state.currentRecipient = state.recipients[state.index]
+    UpdatePanel()
+
+    -- BAG_UPDATE_DELAYED is the normal continuation path.  Keep a timer
+    -- fallback in case another addon/client quirk swallows that event.
+    C_Timer.After(0.05, function()
+        VerifySplitAndAttach(generation)
+    end)
+end
+
+local function BeginAttachOneConfiguredItem(generation, retries)
+    if generation ~= state.generation or not state.running or state.awaitingResult or state.awaitingAttachment or state.awaitingSplit then
+        return
+    end
+
+    -- Prefer an existing 1-item stack.  This both matches the proven manual
+    -- workflow and prevents a large stack earlier in bag order from winning.
+    local singleBag, singleSlot, singleLocked = FindConfiguredSingleton()
+    if singleBag then
+        AttachSingletonFromBag(generation, singleBag, singleSlot)
+        return
+    end
+
+    local bag, slot, stackCount, largeLocked = FindConfiguredLargeStack()
+    if bag then
+        PrepareOneItemInBag(generation, bag, slot)
+        return
+    end
+
+    if (singleLocked or largeLocked) and retries < 20 then
+        C_Timer.After(0.05, function()
+            BeginAttachOneConfiguredItem(generation, retries + 1)
+        end)
+        return
+    end
+
+    local itemName = GetConfiguredItemName()
+    if singleLocked or largeLocked then
+        StopRun("Stopped: the remaining " .. itemName .. " is still locked in your bags.", true)
+    else
+        StopRun("Stopped: no accessible " .. itemName .. " remains in your bags.", true)
+    end
+end
+
+VerifySplitAndAttach = function(generation)
+    if generation ~= state.generation or not state.running or not state.awaitingSplit or state.awaitingResult or state.awaitingAttachment then
+        return
+    end
+
+    local bag, slot = state.splitBag, state.splitSlot
+    local info = bag and slot and GetContainerInfo(bag, slot) or nil
+
+    if info and info.itemID == GetConfiguredItemID() and (info.stackCount or 0) == 1 and not info.isLocked then
+        state.awaitingSplit = false
+        state.splitVerifyAttempts = 0
+        state.splitBag = nil
+        state.splitSlot = nil
+
+        -- Do not pick the newly created stack back up in the same bag-update
+        -- tick in which it became available.
+        C_Timer.After(0.02, function()
+            AttachSingletonFromBag(generation, bag, slot)
+        end)
+        return
+    end
+
+    state.splitVerifyAttempts = state.splitVerifyAttempts + 1
+    if state.splitVerifyAttempts < 40 then
+        C_Timer.After(0.05, function()
+            VerifySplitAndAttach(generation)
+        end)
+        return
+    end
+
+    StopRun("Stopped: WoW did not finish creating the 1-item " .. GetConfiguredItemName() .. " stack in the temporary bag slot.", true)
 end
 
 VerifyAttachmentAndSend = function(generation)
@@ -347,8 +506,6 @@ VerifyAttachmentAndSend = function(generation)
         return
     end
 
-    -- Attachment information can lag the cursor/drop operation by a frame or
-    -- two on Classic. Give WoW up to ~1 second to publish the final slot info.
     state.attachmentVerifyAttempts = state.attachmentVerifyAttempts + 1
     if state.attachmentVerifyAttempts < 20 then
         C_Timer.After(0.05, function()
@@ -362,7 +519,7 @@ VerifyAttachmentAndSend = function(generation)
 end
 
 SendNext = function()
-    if not state.running or state.awaitingResult or state.awaitingAttachment then
+    if not state.running or state.awaitingResult or state.awaitingAttachment or state.awaitingSplit then
         return
     end
 
@@ -421,6 +578,10 @@ local function StartRun()
     state.awaitingResult = false
     state.awaitingAttachment = false
     state.attachmentVerifyAttempts = 0
+    state.awaitingSplit = false
+    state.splitVerifyAttempts = 0
+    state.splitBag = nil
+    state.splitSlot = nil
     state.recipients = recipients
     state.index = 1
     state.sent = 0
@@ -512,6 +673,10 @@ frame:SetScript("OnEvent", function(_, event)
             state.awaitingResult = false
             state.awaitingAttachment = false
             state.attachmentVerifyAttempts = 0
+            state.awaitingSplit = false
+            state.splitVerifyAttempts = 0
+            state.splitBag = nil
+            state.splitSlot = nil
             state.currentRecipient = nil
             state.cancelRequested = false
             Print("Stopped because the mailbox is no longer open.")
@@ -558,6 +723,12 @@ frame:SetScript("OnEvent", function(_, event)
 
     elseif event == "BAG_UPDATE_DELAYED" then
         UpdatePanel()
+        if state.running and state.awaitingSplit then
+            local generation = state.generation
+            C_Timer.After(0.01, function()
+                VerifySplitAndAttach(generation)
+            end)
+        end
     end
 end)
 

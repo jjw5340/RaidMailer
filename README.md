@@ -1,4 +1,4 @@
-RaidMailer 0.2.1
+RaidMailer 0.3.0
 For WoW Burning Crusade Classic Anniversary 2.5.6 (Interface 20506)
 
 PURPOSE
@@ -27,13 +27,13 @@ Anothername
 
 USE
 ---
-1. Have enough of the configured item in your normal bags.
+1. Have enough of the configured item in your normal bags. If the items are stacked, keep at least one empty slot in the backpack or an ordinary bag so RaidMailer can temporarily split off one item.
 2. Open a mailbox.
 3. Select the normal Send Mail tab.
 4. The RaidMailer panel appears to the right.
 5. Click the Send button once.
 
-The addon sends one mail at a time. It waits for WoW to confirm the attachment state, then waits for MAIL_SEND_SUCCESS before sending the next one and stops immediately on MAIL_FAILED.
+The addon sends one mail at a time. It prefers existing 1-item stacks. If only larger stacks are available, it splits one item into an empty ordinary bag slot, waits for the bag update, then attaches that 1-item stack. It waits for WoW to confirm the attachment state, then waits for MAIL_SEND_SUCCESS before sending the next one and stops immediately on MAIL_FAILED.
 
 SAFETY BEHAVIOR
 ---------------

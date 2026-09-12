@@ -2,7 +2,7 @@
 ## Title: RaidMailer
 ## Notes: Sends one configured item to each configured raid member.
 ## Author: ChatGPT
-## Version: 0.2.1
+## Version: 0.3.0
 
 RaidMailerConfig.lua
 RaidMailer.lua
