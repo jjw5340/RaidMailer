@@ -1,0 +1,8 @@
+## Interface: 20506
+## Title: Illidari Mailer
+## Notes: Sends one Mark of the Illidari to each configured raid member.
+## Author: ChatGPT
+## Version: 0.1.0
+
+Recipients.lua
+IllidariMailer.lua
