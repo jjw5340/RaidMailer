@@ -12,6 +12,12 @@
 -- is especially laggy. RaidMailer also verifies that the previous outgoing
 -- attachment slot has actually cleared before proceeding.
 --
+-- PANEL POSITION
+-- The RaidMailer panel is anchored with its TOPLEFT corner to the mailbox
+-- window's TOPRIGHT corner. panelOffsetX moves it horizontally (positive =
+-- right); panelOffsetY moves it vertically (positive = up). The defaults
+-- below reproduce the original RaidMailer position.
+--
 -- RECIPIENTS
 -- Put ONE character name per line inside the [[ ... ]] block.
 -- Blank lines and lines beginning with # are ignored.
@@ -23,6 +29,8 @@
 RaidMailerConfig = {
     itemID = 32897,
     interMailDelay = 1.0,
+    panelOffsetX = 8,
+    panelOffsetY = -32,
 
     recipients = [[
 # Character01

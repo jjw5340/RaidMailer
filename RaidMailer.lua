@@ -2,6 +2,8 @@ local ADDON_NAME = ...
 
 local BODY = ""
 local DEFAULT_NEXT_MAIL_DELAY = 1.00
+local DEFAULT_PANEL_OFFSET_X = 8
+local DEFAULT_PANEL_OFFSET_Y = -32
 local ATTACHMENT_SETTLE_DELAY = 0.35
 local MAIL_CLEAR_TIMEOUT = 12.0
 local STATE_POLL_INTERVAL = 0.10
@@ -20,6 +22,16 @@ local function GetNextMailDelay()
         return math.max(0.75, math.min(configured, 10.0))
     end
     return DEFAULT_NEXT_MAIL_DELAY
+end
+
+local function GetPanelOffsetX()
+    local configured = RaidMailerConfig and tonumber(RaidMailerConfig.panelOffsetX)
+    return configured or DEFAULT_PANEL_OFFSET_X
+end
+
+local function GetPanelOffsetY()
+    local configured = RaidMailerConfig and tonumber(RaidMailerConfig.panelOffsetY)
+    return configured or DEFAULT_PANEL_OFFSET_Y
 end
 
 local function GetConfiguredItemID()
@@ -332,7 +344,7 @@ local function SplitContainerStack(bag, slot, count)
     end
 end
 
-local function HasExistingDraft()
+local function HasBlockingDraft()
     for i = 1, (ATTACHMENTS_MAX_SEND or 12) do
         if GetSendMailItem(i) then
             return true, "an item attachment"
@@ -347,9 +359,10 @@ local function HasExistingDraft()
         return true, "a C.O.D. amount"
     end
 
-    if SendMailNameEditBox and Trim(SendMailNameEditBox:GetText() or "") ~= "" then
-        return true, "a recipient"
-    end
+    -- A recipient by itself is intentionally NOT considered a blocking draft.
+    -- RaidMailer owns the recipient field while a batch is running and
+    -- SendNext() calls ClearSendMail() before composing every outgoing mail.
+    -- This lets a stale/manual recipient be cleared automatically on start.
 
     if SendMailSubjectEditBox and Trim(SendMailSubjectEditBox:GetText() or "") ~= "" then
         return true, "a subject"
@@ -362,8 +375,15 @@ local function HasExistingDraft()
     return false
 end
 
+local function ApplyPanelPosition()
+    if not panel or not MailFrame then return end
+    panel:ClearAllPoints()
+    panel:SetPoint("TOPLEFT", MailFrame, "TOPRIGHT", GetPanelOffsetX(), GetPanelOffsetY())
+end
+
 local function UpdatePanel()
     if not panel then return end
+    ApplyPanelPosition()
 
     local itemID = GetConfiguredItemID()
     local itemName = GetRunItemName()
@@ -781,10 +801,16 @@ local function ValidateMailboxReady()
         return false
     end
 
-    local hasDraft, draftPart = HasExistingDraft()
+    local hasDraft, draftPart = HasBlockingDraft()
     if hasDraft then
         Print("Cannot start while the normal Send Mail window contains " .. draftPart .. ". Clear the draft first.")
         return false
+    end
+
+    -- A leftover recipient is harmless: clear the normal compose state
+    -- automatically instead of making the user fix it and click again.
+    if SendMailNameEditBox and Trim(SendMailNameEditBox:GetText() or "") ~= "" then
+        ClearSendMail()
     end
 
     return true
@@ -951,7 +977,7 @@ local function CreatePanel()
 
     panel = CreateFrame("Frame", "RaidMailerPanel", SendMailFrame, "BackdropTemplate")
     panel:SetSize(255, 128)
-    panel:SetPoint("TOPLEFT", MailFrame, "TOPRIGHT", 8, -32)
+    ApplyPanelPosition()
     panel:SetBackdrop({
         bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
         edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",

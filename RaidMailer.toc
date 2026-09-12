@@ -2,7 +2,7 @@
 ## Title: RaidMailer
 ## Notes: Sends one configured item to each configured raid member with resumable batch progress.
 ## Author: ChatGPT
-## Version: 0.5.1
+## Version: 0.6.0
 ## SavedVariablesPerCharacter: RaidMailerDB
 
 RaidMailerConfig.lua
