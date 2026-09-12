@@ -1,10 +1,21 @@
 local ADDON_NAME = ...
 
-local ITEM_ID = 32897 -- Mark of the Illidari
-local ITEM_NAME = "Mark of the Illidari"
-local SUBJECT = "Mark of the Illidari"
 local BODY = ""
 local NEXT_MAIL_DELAY = 0.10
+
+local function GetConfiguredItemID()
+    return RaidMailerConfig and tonumber(RaidMailerConfig.itemID) or nil
+end
+
+local function GetConfiguredItemName()
+    local itemID = GetConfiguredItemID()
+    if not itemID then
+        return "configured item"
+    end
+
+    local name = GetItemInfo(itemID)
+    return name or ("item " .. itemID)
+end
 
 local frame = CreateFrame("Frame")
 local panel
@@ -25,7 +36,7 @@ local state = {
 }
 
 local function Print(message)
-    DEFAULT_CHAT_FRAME:AddMessage("|cff9482c9Illidari Mailer:|r " .. tostring(message))
+    DEFAULT_CHAT_FRAME:AddMessage("|cff9482c9RaidMailer:|r " .. tostring(message))
 end
 
 local function Trim(text)
@@ -55,7 +66,7 @@ local function IsPlayerCharacter(recipient)
 end
 
 local function ParseRecipients()
-    local text = IllidariMailerRecipientText or ""
+    local text = (RaidMailerConfig and RaidMailerConfig.recipients) or ""
     text = text:gsub("\r\n", "\n"):gsub("\r", "\n")
     local recipients = {}
     local seen = {}
@@ -110,12 +121,15 @@ local function GetNumSlots(bag)
     return GetContainerNumSlots(bag)
 end
 
-local function CountMarksInBags()
+local function CountConfiguredItemsInBags()
+    local itemID = GetConfiguredItemID()
+    if not itemID then return 0 end
+
     local total = 0
     for bag = 0, 4 do
         for slot = 1, GetNumSlots(bag) do
             local info = GetContainerInfo(bag, slot)
-            if info and info.itemID == ITEM_ID then
+            if info and info.itemID == itemID then
                 total = total + (info.stackCount or 0)
             end
         end
@@ -123,13 +137,16 @@ local function CountMarksInBags()
     return total
 end
 
-local function FindMarkStack()
+local function FindConfiguredItemStack()
+    local itemID = GetConfiguredItemID()
+    if not itemID then return nil, nil, nil, false end
+
     local foundLocked = false
 
     for bag = 0, 4 do
         for slot = 1, GetNumSlots(bag) do
             local info = GetContainerInfo(bag, slot)
-            if info and info.itemID == ITEM_ID then
+            if info and info.itemID == itemID then
                 if info.isLocked then
                     foundLocked = true
                 elseif (info.stackCount or 0) > 0 then
@@ -175,8 +192,10 @@ end
 local function UpdatePanel()
     if not panel then return end
 
+    local itemID = GetConfiguredItemID()
+    local itemName = GetConfiguredItemName()
     local recipients, duplicates, skippedSelf = ParseRecipients()
-    local marks = CountMarksInBags()
+    local items = CountConfiguredItemsInBags()
 
     if state.running then
         sendButton:SetText("Sending...")
@@ -190,31 +209,35 @@ local function UpdatePanel()
         else
             statusText:SetText(string.format("Sent %d/%d", state.sent, total))
         end
-        detailText:SetText(string.format("Marks remaining: %d", marks))
+        detailText:SetText(string.format("%s remaining: %d", itemName, items))
         return
     end
 
-    sendButton:SetText(string.format("Send Marks (%d)", #recipients))
+    sendButton:SetText(string.format("Send Items (%d)", #recipients))
     cancelButton:Disable()
 
-    if #duplicates > 0 then
+    if not itemID or itemID <= 0 or itemID ~= math.floor(itemID) then
+        statusText:SetText("Invalid item configuration")
+        detailText:SetText("Set itemID in RaidMailerConfig.lua to a valid numeric WoW item ID.")
+        sendButton:Disable()
+    elseif #duplicates > 0 then
         statusText:SetText("Fix duplicate recipient names")
         detailText:SetText(table.concat(duplicates, ", "))
         sendButton:Disable()
     elseif #recipients == 0 then
         statusText:SetText("No recipients configured")
-        detailText:SetText("Edit Recipients.lua: one character name per line.")
+        detailText:SetText("Edit RaidMailerConfig.lua: one character name per line.")
         sendButton:Disable()
-    elseif marks < #recipients then
-        statusText:SetText(string.format("Need %d Marks; you have %d", #recipients, marks))
-        detailText:SetText("Not enough Marks of the Illidari in your bags.")
+    elseif items < #recipients then
+        statusText:SetText(string.format("Need %d; you have %d", #recipients, items))
+        detailText:SetText("Configured item: " .. itemName)
         sendButton:Disable()
     else
-        statusText:SetText(string.format("Ready: %d recipients, %d Marks", #recipients, marks))
+        statusText:SetText(string.format("Ready: %d recipients, %d items", #recipients, items))
         if skippedSelf > 0 then
-            detailText:SetText(string.format("Your character is listed and will be skipped (%d time%s).", skippedSelf, skippedSelf == 1 and "" or "s"))
+            detailText:SetText(string.format("%s. Your character is listed and will be skipped (%d time%s).", itemName, skippedSelf, skippedSelf == 1 and "" or "s"))
         else
-            detailText:SetText("One Mark will be mailed to each listed character.")
+            detailText:SetText("One " .. itemName .. " will be mailed to each listed character.")
         end
         sendButton:Enable()
     end
@@ -242,8 +265,8 @@ local function StopRun(message, isError)
     end
 end
 
-local function AttachOneMark()
-    local bag, slot, stackCount, locked = FindMarkStack()
+local function AttachOneConfiguredItem()
+    local bag, slot, stackCount, locked = FindConfiguredItemStack()
     if not bag then
         if locked then
             return false, "locked"
@@ -274,7 +297,7 @@ local function AttachOneMark()
     ClickSendMailItemButton(1)
 
     local name, itemID, _, count = GetSendMailItem(1)
-    if not name or itemID ~= ITEM_ID or count ~= 1 then
+    if not name or itemID ~= GetConfiguredItemID() or count ~= 1 then
         ClearCursor()
         ClearSendMail()
         return false, "attachment"
@@ -290,13 +313,13 @@ local function RetrySendNext(generation, retries)
         return
     end
 
-    local ok, reason = AttachOneMark()
+    local ok, reason = AttachOneConfiguredItem()
     if ok then
         local recipient = state.recipients[state.index]
         state.currentRecipient = recipient
         state.awaitingResult = true
         UpdatePanel()
-        SendMail(recipient, SUBJECT, BODY)
+        SendMail(recipient, GetConfiguredItemName(), BODY)
         return
     end
 
@@ -307,12 +330,13 @@ local function RetrySendNext(generation, retries)
         return
     end
 
+    local itemName = GetConfiguredItemName()
     if reason == "missing" then
-        StopRun("Stopped: no accessible " .. ITEM_NAME .. " remains in your bags.", true)
+        StopRun("Stopped: no accessible " .. itemName .. " remains in your bags.", true)
     elseif reason == "attachment" then
-        StopRun("Stopped: WoW did not attach exactly one " .. ITEM_NAME .. ".", true)
+        StopRun("Stopped: WoW did not attach exactly one " .. itemName .. ".", true)
     else
-        StopRun("Stopped: could not pick up a " .. ITEM_NAME .. " from your bags.", true)
+        StopRun("Stopped: could not pick up a " .. itemName .. " from your bags.", true)
     end
 end
 
@@ -328,7 +352,7 @@ SendNext = function()
 
     if state.index > #state.recipients then
         local sent = state.sent
-        StopRun(string.format("Complete: sent %d %s%s.", sent, ITEM_NAME, sent == 1 and "" or "s"), false)
+        StopRun(string.format("Complete: sent %d item%s (%s).", sent, sent == 1 and "" or "s", GetConfiguredItemName()), false)
         return
     end
 
@@ -341,6 +365,12 @@ end
 local function StartRun()
     if state.running then return end
 
+    local itemID = GetConfiguredItemID()
+    if not itemID or itemID <= 0 or itemID ~= math.floor(itemID) then
+        Print("Cannot start: set a valid numeric itemID in RaidMailerConfig.lua.")
+        return
+    end
+
     local recipients, duplicates, skippedSelf = ParseRecipients()
 
     if #duplicates > 0 then
@@ -349,7 +379,7 @@ local function StartRun()
     end
 
     if #recipients == 0 then
-        Print("Cannot start: no recipients are configured in Recipients.lua.")
+        Print("Cannot start: no recipients are configured in RaidMailerConfig.lua.")
         return
     end
 
@@ -359,9 +389,9 @@ local function StartRun()
         return
     end
 
-    local marks = CountMarksInBags()
-    if marks < #recipients then
-        Print(string.format("Cannot start: need %d Marks but only %d are in your bags.", #recipients, marks))
+    local items = CountConfiguredItemsInBags()
+    if items < #recipients then
+        Print(string.format("Cannot start: need %d %s but only %d are in your bags.", #recipients, GetConfiguredItemName(), items))
         return
     end
 
@@ -397,7 +427,7 @@ end
 local function CreatePanel()
     if panel or not SendMailFrame then return end
 
-    panel = CreateFrame("Frame", "IllidariMailerPanel", SendMailFrame, "BackdropTemplate")
+    panel = CreateFrame("Frame", "RaidMailerPanel", SendMailFrame, "BackdropTemplate")
     panel:SetSize(255, 128)
     panel:SetPoint("TOPLEFT", MailFrame, "TOPRIGHT", 8, -32)
     panel:SetBackdrop({
@@ -411,7 +441,7 @@ local function CreatePanel()
 
     local title = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     title:SetPoint("TOP", 0, -12)
-    title:SetText("Illidari Mailer")
+    title:SetText("RaidMailer")
 
     statusText = panel:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
     statusText:SetPoint("TOPLEFT", 12, -38)
@@ -497,9 +527,9 @@ frame:SetScript("OnEvent", function(_, event)
     end
 end)
 
-SLASH_ILLIDARIMAILER1 = "/illidarimailer"
-SLASH_ILLIDARIMAILER2 = "/imailer"
-SlashCmdList.ILLIDARIMAILER = function(msg)
+SLASH_RAIDMAILER1 = "/rm"
+SLASH_RAIDMAILER2 = "/raidmailer"
+SlashCmdList.RAIDMAILER = function(msg)
     msg = Trim((msg or ""):lower())
 
     if msg == "send" then
@@ -508,7 +538,7 @@ SlashCmdList.ILLIDARIMAILER = function(msg)
         CancelRun()
     else
         local recipients, duplicates, skippedSelf = ParseRecipients()
-        Print(string.format("%d recipient(s), %d Mark(s) in bags, %d duplicate(s), %d self entry/entries skipped.", #recipients, CountMarksInBags(), #duplicates, skippedSelf))
-        Print("Open a mailbox, select the Send Mail tab, and use the Illidari Mailer panel. Commands: /imailer send, /imailer cancel")
+        Print(string.format("Item: %s. %d recipient(s), %d in bags, %d duplicate(s), %d self entry/entries skipped.", GetConfiguredItemName(), #recipients, CountConfiguredItemsInBags(), #duplicates, skippedSelf))
+        Print("Open a mailbox, select the Send Mail tab, and use the RaidMailer panel. Commands: /rm send, /rm cancel")
     end
 end

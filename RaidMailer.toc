@@ -1,0 +1,8 @@
+## Interface: 20506
+## Title: RaidMailer
+## Notes: Sends one configured item to each configured raid member.
+## Author: ChatGPT
+## Version: 0.2.0
+
+RaidMailerConfig.lua
+RaidMailer.lua
