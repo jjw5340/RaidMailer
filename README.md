@@ -1,4 +1,4 @@
-RaidMailer 0.3.0
+RaidMailer 0.4.0
 For WoW Burning Crusade Classic Anniversary 2.5.6 (Interface 20506)
 
 PURPOSE
@@ -33,7 +33,7 @@ USE
 4. The RaidMailer panel appears to the right.
 5. Click the Send button once.
 
-The addon sends one mail at a time. It prefers existing 1-item stacks. If only larger stacks are available, it splits one item into an empty ordinary bag slot, waits for the bag update, then attaches that 1-item stack. It waits for WoW to confirm the attachment state, then waits for MAIL_SEND_SUCCESS before sending the next one and stops immediately on MAIL_FAILED.
+The addon sends one mail at a time. It prefers existing 1-item stacks. If only larger stacks are available, it splits one item into an empty ordinary bag slot, waits for the bag update, then attaches that 1-item stack. It waits for WoW to confirm the attachment state, gives the mail UI a short settle period, then waits for MAIL_SEND_SUCCESS before sending the next one. Bag/attachment synchronization may take up to about 12 seconds before timing out. Transient MAIL_FAILED results retry the same recipient up to 3 times with increasing delays before the batch stops.
 
 SAFETY BEHAVIOR
 ---------------

@@ -1,7 +1,14 @@
 local ADDON_NAME = ...
 
 local BODY = ""
-local NEXT_MAIL_DELAY = 0.10
+local NEXT_MAIL_DELAY = 1.00
+local ATTACHMENT_SETTLE_DELAY = 0.50
+local STATE_POLL_INTERVAL = 0.10
+local BAG_OPERATION_TIMEOUT = 12.0
+local ATTACHMENT_TIMEOUT = 12.0
+local ITEM_LOCK_TIMEOUT = 12.0
+local MAIL_RETRY_DELAY = 2.0
+local MAX_MAIL_RETRIES = 3
 
 local function GetConfiguredItemID()
     return RaidMailerConfig and tonumber(RaidMailerConfig.itemID) or nil
@@ -28,11 +35,13 @@ local state = {
     running = false,
     awaitingResult = false,
     awaitingAttachment = false,
-    attachmentVerifyAttempts = 0,
+    attachmentStartedAt = nil,
     awaitingSplit = false,
-    splitVerifyAttempts = 0,
+    splitStartedAt = nil,
     splitBag = nil,
     splitSlot = nil,
+    awaitingRetry = false,
+    mailRetryCount = 0,
     recipients = {},
     index = 0,
     sent = 0,
@@ -272,7 +281,9 @@ local function UpdatePanel()
 
         local total = #state.recipients
         local nextNumber = math.min(state.sent + 1, total)
-        if state.currentRecipient then
+        if state.awaitingRetry and state.currentRecipient then
+            statusText:SetText(string.format("Retrying %d/%d: %s", nextNumber, total, state.currentRecipient))
+        elseif state.currentRecipient then
             statusText:SetText(string.format("Sending %d/%d: %s", nextNumber, total, state.currentRecipient))
         else
             statusText:SetText(string.format("Sent %d/%d", state.sent, total))
@@ -316,11 +327,13 @@ local function StopRun(message, isError)
     state.running = false
     state.awaitingResult = false
     state.awaitingAttachment = false
-    state.attachmentVerifyAttempts = 0
+    state.attachmentStartedAt = nil
     state.awaitingSplit = false
-    state.splitVerifyAttempts = 0
+    state.splitStartedAt = nil
     state.splitBag = nil
     state.splitSlot = nil
+    state.awaitingRetry = false
+    state.mailRetryCount = 0
     state.currentRecipient = nil
     state.cancelRequested = false
 
@@ -344,9 +357,10 @@ end
 local SendNext
 local VerifyAttachmentAndSend
 local VerifySplitAndAttach
+local RetryCurrentMail
 
-local function AttachSingletonFromBag(generation, bag, slot)
-    if generation ~= state.generation or not state.running or state.awaitingResult or state.awaitingAttachment or state.awaitingSplit then
+local function AttachSingletonFromBag(generation, bag, slot, lockStartedAt)
+    if generation ~= state.generation or not state.running or state.awaitingResult or state.awaitingAttachment or state.awaitingSplit or state.awaitingRetry then
         return
     end
 
@@ -357,9 +371,15 @@ local function AttachSingletonFromBag(generation, bag, slot)
     end
 
     if info.isLocked then
-        C_Timer.After(0.05, function()
-            AttachSingletonFromBag(generation, bag, slot)
-        end)
+        lockStartedAt = lockStartedAt or GetTime()
+        if GetTime() - lockStartedAt < ITEM_LOCK_TIMEOUT then
+            C_Timer.After(STATE_POLL_INTERVAL, function()
+                AttachSingletonFromBag(generation, bag, slot, lockStartedAt)
+            end)
+            return
+        end
+
+        StopRun("Stopped: the prepared 1-item " .. GetConfiguredItemName() .. " stack remained locked for more than " .. ITEM_LOCK_TIMEOUT .. " seconds.", true)
         return
     end
 
@@ -374,13 +394,13 @@ local function AttachSingletonFromBag(generation, bag, slot)
     -- MAIL_SEND_INFO_UPDATE may fire from inside ClickSendMailItemButton(),
     -- so mark this state before dropping the cursor item into the mail slot.
     state.awaitingAttachment = true
-    state.attachmentVerifyAttempts = 0
+    state.attachmentStartedAt = GetTime()
     state.currentRecipient = state.recipients[state.index]
     UpdatePanel()
 
     ClickSendMailItemButton(1)
 
-    C_Timer.After(0.05, function()
+    C_Timer.After(STATE_POLL_INTERVAL, function()
         VerifyAttachmentAndSend(generation)
     end)
 end
@@ -411,7 +431,7 @@ local function PrepareOneItemInBag(generation, sourceBag, sourceSlot)
     end
 
     state.awaitingSplit = true
-    state.splitVerifyAttempts = 0
+    state.splitStartedAt = GetTime()
     state.splitBag = emptyBag
     state.splitSlot = emptySlot
     state.currentRecipient = state.recipients[state.index]
@@ -419,13 +439,13 @@ local function PrepareOneItemInBag(generation, sourceBag, sourceSlot)
 
     -- BAG_UPDATE_DELAYED is the normal continuation path.  Keep a timer
     -- fallback in case another addon/client quirk swallows that event.
-    C_Timer.After(0.05, function()
+    C_Timer.After(STATE_POLL_INTERVAL, function()
         VerifySplitAndAttach(generation)
     end)
 end
 
-local function BeginAttachOneConfiguredItem(generation, retries)
-    if generation ~= state.generation or not state.running or state.awaitingResult or state.awaitingAttachment or state.awaitingSplit then
+local function BeginAttachOneConfiguredItem(generation, lockStartedAt)
+    if generation ~= state.generation or not state.running or state.awaitingResult or state.awaitingAttachment or state.awaitingSplit or state.awaitingRetry then
         return
     end
 
@@ -443,23 +463,26 @@ local function BeginAttachOneConfiguredItem(generation, retries)
         return
     end
 
-    if (singleLocked or largeLocked) and retries < 20 then
-        C_Timer.After(0.05, function()
-            BeginAttachOneConfiguredItem(generation, retries + 1)
-        end)
-        return
+    if singleLocked or largeLocked then
+        lockStartedAt = lockStartedAt or GetTime()
+        if GetTime() - lockStartedAt < ITEM_LOCK_TIMEOUT then
+            C_Timer.After(STATE_POLL_INTERVAL, function()
+                BeginAttachOneConfiguredItem(generation, lockStartedAt)
+            end)
+            return
+        end
     end
 
     local itemName = GetConfiguredItemName()
     if singleLocked or largeLocked then
-        StopRun("Stopped: the remaining " .. itemName .. " is still locked in your bags.", true)
+        StopRun("Stopped: the remaining " .. itemName .. " stayed locked for more than " .. ITEM_LOCK_TIMEOUT .. " seconds.", true)
     else
         StopRun("Stopped: no accessible " .. itemName .. " remains in your bags.", true)
     end
 end
 
 VerifySplitAndAttach = function(generation)
-    if generation ~= state.generation or not state.running or not state.awaitingSplit or state.awaitingResult or state.awaitingAttachment then
+    if generation ~= state.generation or not state.running or not state.awaitingSplit or state.awaitingResult or state.awaitingAttachment or state.awaitingRetry then
         return
     end
 
@@ -468,58 +491,97 @@ VerifySplitAndAttach = function(generation)
 
     if info and info.itemID == GetConfiguredItemID() and (info.stackCount or 0) == 1 and not info.isLocked then
         state.awaitingSplit = false
-        state.splitVerifyAttempts = 0
+        state.splitStartedAt = nil
         state.splitBag = nil
         state.splitSlot = nil
 
-        -- Do not pick the newly created stack back up in the same bag-update
-        -- tick in which it became available.
-        C_Timer.After(0.02, function()
+        -- Give the bag system one additional frame after the slot becomes
+        -- readable before picking the new singleton back up.
+        C_Timer.After(STATE_POLL_INTERVAL, function()
             AttachSingletonFromBag(generation, bag, slot)
         end)
         return
     end
 
-    state.splitVerifyAttempts = state.splitVerifyAttempts + 1
-    if state.splitVerifyAttempts < 40 then
-        C_Timer.After(0.05, function()
+    local startedAt = state.splitStartedAt or GetTime()
+    state.splitStartedAt = startedAt
+    if GetTime() - startedAt < BAG_OPERATION_TIMEOUT then
+        C_Timer.After(STATE_POLL_INTERVAL, function()
             VerifySplitAndAttach(generation)
         end)
         return
     end
 
-    StopRun("Stopped: WoW did not finish creating the 1-item " .. GetConfiguredItemName() .. " stack in the temporary bag slot.", true)
+    StopRun("Stopped: WoW did not finish creating the 1-item " .. GetConfiguredItemName() .. " stack within " .. BAG_OPERATION_TIMEOUT .. " seconds.", true)
+end
+
+local function SendCurrentMail(generation)
+    if generation ~= state.generation or not state.running or state.awaitingResult or state.awaitingRetry then
+        return
+    end
+
+    state.awaitingAttachment = false
+    state.attachmentStartedAt = nil
+    state.awaitingResult = true
+    UpdatePanel()
+    SendMail(state.currentRecipient, GetConfiguredItemName(), BODY)
 end
 
 VerifyAttachmentAndSend = function(generation)
-    if generation ~= state.generation or not state.running or not state.awaitingAttachment or state.awaitingResult then
+    if generation ~= state.generation or not state.running or not state.awaitingAttachment or state.awaitingResult or state.awaitingRetry then
         return
     end
 
     local name, itemID, _, count = GetSendMailItem(1)
     if name and itemID == GetConfiguredItemID() and count == 1 then
+        -- GetSendMailItem() can become readable slightly before the mail UI/server
+        -- is fully settled.  Stop further attachment verification now, then
+        -- give WoW a short quiet period before calling SendMail().
         state.awaitingAttachment = false
-        state.attachmentVerifyAttempts = 0
-        state.awaitingResult = true
-        UpdatePanel()
-        SendMail(state.currentRecipient, GetConfiguredItemName(), BODY)
+        state.attachmentStartedAt = nil
+        C_Timer.After(ATTACHMENT_SETTLE_DELAY, function()
+            SendCurrentMail(generation)
+        end)
         return
     end
 
-    state.attachmentVerifyAttempts = state.attachmentVerifyAttempts + 1
-    if state.attachmentVerifyAttempts < 20 then
-        C_Timer.After(0.05, function()
+    local startedAt = state.attachmentStartedAt or GetTime()
+    state.attachmentStartedAt = startedAt
+    if GetTime() - startedAt < ATTACHMENT_TIMEOUT then
+        C_Timer.After(STATE_POLL_INTERVAL, function()
             VerifyAttachmentAndSend(generation)
         end)
         return
     end
 
     ClearCursor()
-    StopRun("Stopped: WoW did not attach exactly one " .. GetConfiguredItemName() .. ".", true)
+    StopRun("Stopped: WoW did not attach exactly one " .. GetConfiguredItemName() .. " within " .. ATTACHMENT_TIMEOUT .. " seconds.", true)
+end
+
+RetryCurrentMail = function(generation)
+    if generation ~= state.generation or not state.running or not state.awaitingRetry then
+        return
+    end
+
+    state.awaitingRetry = false
+
+    -- A failed SendMail attempt normally leaves the attachment in the compose
+    -- window.  Reuse it when it is still exactly the configured singleton.
+    local name, itemID, _, count = GetSendMailItem(1)
+    if name and itemID == GetConfiguredItemID() and count == 1 then
+        SendCurrentMail(generation)
+        return
+    end
+
+    -- If WoW returned the attachment to the bags instead, rebuild the same
+    -- recipient's message.  Never advance the recipient index on MAIL_FAILED.
+    ClearSendMail()
+    state.currentRecipient = state.recipients[state.index]
+    BeginAttachOneConfiguredItem(generation, GetTime())
 end
 
 SendNext = function()
-    if not state.running or state.awaitingResult or state.awaitingAttachment or state.awaitingSplit then
+    if not state.running or state.awaitingResult or state.awaitingAttachment or state.awaitingSplit or state.awaitingRetry then
         return
     end
 
@@ -537,7 +599,7 @@ SendNext = function()
     -- Each successful send should clear the compose state, but explicitly
     -- clear it here as well so every outgoing message starts from a known state.
     ClearSendMail()
-    BeginAttachOneConfiguredItem(state.generation, 0)
+    BeginAttachOneConfiguredItem(state.generation, GetTime())
 end
 
 local function StartRun()
@@ -577,11 +639,13 @@ local function StartRun()
     state.running = true
     state.awaitingResult = false
     state.awaitingAttachment = false
-    state.attachmentVerifyAttempts = 0
+    state.attachmentStartedAt = nil
     state.awaitingSplit = false
-    state.splitVerifyAttempts = 0
+    state.splitStartedAt = nil
     state.splitBag = nil
     state.splitSlot = nil
+    state.awaitingRetry = false
+    state.mailRetryCount = 0
     state.recipients = recipients
     state.index = 1
     state.sent = 0
@@ -672,11 +736,13 @@ frame:SetScript("OnEvent", function(_, event)
             state.running = false
             state.awaitingResult = false
             state.awaitingAttachment = false
-            state.attachmentVerifyAttempts = 0
+            state.attachmentStartedAt = nil
             state.awaitingSplit = false
-            state.splitVerifyAttempts = 0
+            state.splitStartedAt = nil
             state.splitBag = nil
             state.splitSlot = nil
+            state.awaitingRetry = false
+            state.mailRetryCount = 0
             state.currentRecipient = nil
             state.cancelRequested = false
             Print("Stopped because the mailbox is no longer open.")
@@ -685,7 +751,7 @@ frame:SetScript("OnEvent", function(_, event)
     elseif event == "MAIL_SEND_INFO_UPDATE" then
         if state.running and state.awaitingAttachment and not state.awaitingResult then
             local generation = state.generation
-            C_Timer.After(0.01, function()
+            C_Timer.After(STATE_POLL_INTERVAL, function()
                 VerifyAttachmentAndSend(generation)
             end)
         end
@@ -696,6 +762,7 @@ frame:SetScript("OnEvent", function(_, event)
         end
 
         state.awaitingResult = false
+        state.mailRetryCount = 0
         state.sent = state.sent + 1
         state.index = state.index + 1
         state.currentRecipient = nil
@@ -718,14 +785,28 @@ frame:SetScript("OnEvent", function(_, event)
         if state.running and state.awaitingResult then
             local failedRecipient = state.currentRecipient or "unknown recipient"
             state.awaitingResult = false
-            StopRun("Mail failed for " .. failedRecipient .. ". No further mail was sent.", true)
+
+            if state.mailRetryCount < MAX_MAIL_RETRIES then
+                state.mailRetryCount = state.mailRetryCount + 1
+                state.awaitingRetry = true
+                local delay = MAIL_RETRY_DELAY * state.mailRetryCount
+                Print(string.format("Mail attempt failed for %s; retrying the same recipient in %.0f second%s (%d/%d).", failedRecipient, delay, delay == 1 and "" or "s", state.mailRetryCount, MAX_MAIL_RETRIES))
+                UpdatePanel()
+
+                local generation = state.generation
+                C_Timer.After(delay, function()
+                    RetryCurrentMail(generation)
+                end)
+            else
+                StopRun("Mail failed for " .. failedRecipient .. " after " .. (MAX_MAIL_RETRIES + 1) .. " attempts. No further mail was sent.", true)
+            end
         end
 
     elseif event == "BAG_UPDATE_DELAYED" then
         UpdatePanel()
         if state.running and state.awaitingSplit then
             local generation = state.generation
-            C_Timer.After(0.01, function()
+            C_Timer.After(STATE_POLL_INTERVAL, function()
                 VerifySplitAndAttach(generation)
             end)
         end
