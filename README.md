@@ -1,4 +1,4 @@
-RaidMailer 0.5.0
+RaidMailer 0.5.1
 For WoW Burning Crusade Classic Anniversary 2.5.6 (Interface 20506)
 
 PURPOSE
@@ -11,7 +11,9 @@ SETUP
 1. Open RaidMailerConfig.lua in a plain-text editor.
 2. Set itemID to the numeric WoW item ID for the item you want to distribute.
 3. Inside the recipients [[ ... ]] block, put one character name per line.
-4. Save the file and /reload WoW.
+4. Optional: interMailDelay controls the minimum quiet time between a confirmed
+   successful send and preparation of the next mail. Default/recommended: 1.0 s.
+5. Save the file and /reload WoW.
 
 USE
 ---
@@ -41,16 +43,27 @@ SLASH COMMANDS
 /rm reset        Forget saved batch progress without sending.
 /rm cancel       Pause the running batch (after the current in-flight mail resolves).
 
-TIMING
-------
-The long synchronization timeouts remain at 12 seconds so server/bag lag does not create false failures. They are ceilings, not fixed delays. Normal successful progression was shortened: the post-success gap is 0.25 seconds and the verified-attachment settle delay is 0.35 seconds.
+TIMING / 0.5.1 CHANGE
+---------------------
+- Restored the normal minimum inter-mail delay to 1.0 second (configurable).
+- After MAIL_SEND_SUCCESS, RaidMailer now waits for that minimum quiet period,
+  then verifies that outgoing attachment slot 1 has actually cleared before
+  manipulating the next bag item.
+- The mail-clear verification can wait up to 12 seconds for server/UI lag.
+- Bag/attachment/lock synchronization ceilings remain 12 seconds.
+- Attachment timeout errors now include what GetSendMailItem(1) actually reports,
+  which makes any remaining Anniversary-client race easier to diagnose.
 
 INSTALLATION
 ------------
 Copy the entire RaidMailer folder to:
 World of Warcraft\_anniversary_\Interface\AddOns\
 
-IMPORTANT WHEN UPDATING FROM 0.4.0
-----------------------------------
-SavedVariables requires a TOC change. Replace BOTH RaidMailer.lua and RaidMailer.toc.
-Keep your existing RaidMailerConfig.lua so your customized item and recipient list are not overwritten.
+UPDATING FROM 0.5.0
+-------------------
+You may replace only RaidMailer.lua. Your existing RaidMailerConfig.lua remains
+compatible and will use the 1.0-second default automatically. If desired, add:
+
+    interMailDelay = 1.0,
+
+to RaidMailerConfig next to itemID so the delay is easy to tune later.

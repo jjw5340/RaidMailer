@@ -5,6 +5,13 @@
 -- RaidMailer sends exactly ONE of this item to each configured recipient.
 -- Example: Mark of the Illidari = 32897
 --
+-- TIMING
+-- interMailDelay is the minimum quiet time (seconds) after a confirmed
+-- MAIL_SEND_SUCCESS before RaidMailer begins preparing the next mail.
+-- 1.0 is the recommended default. Increase to 1.25 or 1.5 if your server/UI
+-- is especially laggy. RaidMailer also verifies that the previous outgoing
+-- attachment slot has actually cleared before proceeding.
+--
 -- RECIPIENTS
 -- Put ONE character name per line inside the [[ ... ]] block.
 -- Blank lines and lines beginning with # are ignored.
@@ -15,6 +22,7 @@
 
 RaidMailerConfig = {
     itemID = 32897,
+    interMailDelay = 1.0,
 
     recipients = [[
 # Character01

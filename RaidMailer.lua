@@ -1,14 +1,26 @@
 local ADDON_NAME = ...
 
 local BODY = ""
-local NEXT_MAIL_DELAY = 0.25
+local DEFAULT_NEXT_MAIL_DELAY = 1.00
 local ATTACHMENT_SETTLE_DELAY = 0.35
+local MAIL_CLEAR_TIMEOUT = 12.0
 local STATE_POLL_INTERVAL = 0.10
 local BAG_OPERATION_TIMEOUT = 12.0
 local ATTACHMENT_TIMEOUT = 12.0
 local ITEM_LOCK_TIMEOUT = 12.0
 local MAIL_RETRY_DELAY = 2.0
 local MAX_MAIL_RETRIES = 3
+
+
+local function GetNextMailDelay()
+    local configured = RaidMailerConfig and tonumber(RaidMailerConfig.interMailDelay)
+    if configured then
+        -- Very short gaps are where the Anniversary mail UI has proven flaky.
+        -- Keep a conservative floor even if the config is accidentally lower.
+        return math.max(0.75, math.min(configured, 10.0))
+    end
+    return DEFAULT_NEXT_MAIL_DELAY
+end
 
 local function GetConfiguredItemID()
     return RaidMailerConfig and tonumber(RaidMailerConfig.itemID) or nil
@@ -44,6 +56,8 @@ local state = {
     splitBag = nil,
     splitSlot = nil,
     awaitingRetry = false,
+    awaitingMailClear = false,
+    mailClearStartedAt = nil,
     mailRetryCount = 0,
     recipients = {},
     itemID = nil,
@@ -445,6 +459,8 @@ local function StopRun(message, isError)
     state.splitBag = nil
     state.splitSlot = nil
     state.awaitingRetry = false
+    state.awaitingMailClear = false
+    state.mailClearStartedAt = nil
     state.mailRetryCount = 0
     state.currentRecipient = nil
     state.itemID = nil
@@ -471,9 +487,10 @@ local SendNext
 local VerifyAttachmentAndSend
 local VerifySplitAndAttach
 local RetryCurrentMail
+local VerifyPreviousMailCleared
 
 local function AttachSingletonFromBag(generation, bag, slot, lockStartedAt)
-    if generation ~= state.generation or not state.running or state.awaitingResult or state.awaitingAttachment or state.awaitingSplit or state.awaitingRetry then
+    if generation ~= state.generation or not state.running or state.awaitingResult or state.awaitingAttachment or state.awaitingSplit or state.awaitingRetry or state.awaitingMailClear then
         return
     end
 
@@ -558,7 +575,7 @@ local function PrepareOneItemInBag(generation, sourceBag, sourceSlot)
 end
 
 local function BeginAttachOneConfiguredItem(generation, lockStartedAt)
-    if generation ~= state.generation or not state.running or state.awaitingResult or state.awaitingAttachment or state.awaitingSplit or state.awaitingRetry then
+    if generation ~= state.generation or not state.running or state.awaitingResult or state.awaitingAttachment or state.awaitingSplit or state.awaitingRetry or state.awaitingMailClear then
         return
     end
 
@@ -667,8 +684,15 @@ VerifyAttachmentAndSend = function(generation)
         return
     end
 
+    local reportedName, reportedItemID, _, reportedCount = GetSendMailItem(1)
+    local diagnostic
+    if reportedName then
+        diagnostic = string.format(" API reports %s (itemID %s, count %s).", tostring(reportedName), tostring(reportedItemID), tostring(reportedCount))
+    else
+        diagnostic = " API reports attachment slot 1 as empty."
+    end
     ClearCursor()
-    StopRun("Stopped: WoW did not attach exactly one " .. GetRunItemName() .. " within " .. ATTACHMENT_TIMEOUT .. " seconds.", true)
+    StopRun("Stopped: WoW did not attach exactly one " .. GetRunItemName() .. " within " .. ATTACHMENT_TIMEOUT .. " seconds." .. diagnostic, true)
 end
 
 RetryCurrentMail = function(generation)
@@ -693,8 +717,42 @@ RetryCurrentMail = function(generation)
     BeginAttachOneConfiguredItem(generation, GetTime())
 end
 
+VerifyPreviousMailCleared = function(generation)
+    if generation ~= state.generation or not state.running or not state.awaitingMailClear then
+        return
+    end
+
+    -- MAIL_SEND_SUCCESS means the server accepted the previous message, but the
+    -- Anniversary compose UI can take noticeably longer to release/clear its
+    -- attachment state.  Force the local compose frame clear only after the
+    -- success event, then wait until the API agrees that slot 1 is empty.
+    if ClearSendMail then
+        ClearSendMail()
+    end
+
+    if not GetSendMailItem(1) then
+        state.awaitingMailClear = false
+        state.mailClearStartedAt = nil
+        SendNext()
+        return
+    end
+
+    local startedAt = state.mailClearStartedAt or GetTime()
+    state.mailClearStartedAt = startedAt
+    if GetTime() - startedAt < MAIL_CLEAR_TIMEOUT then
+        C_Timer.After(STATE_POLL_INTERVAL, function()
+            VerifyPreviousMailCleared(generation)
+        end)
+        return
+    end
+
+    SaveProgress("mailuistuck")
+    StopRun("Paused: WoW did not clear the previous outgoing mail attachment within " .. MAIL_CLEAR_TIMEOUT .. " seconds. Use /rm resume after the mailbox finishes updating.", true)
+end
+
+
 SendNext = function()
-    if not state.running or state.awaitingResult or state.awaitingAttachment or state.awaitingSplit or state.awaitingRetry then
+    if not state.running or state.awaitingResult or state.awaitingAttachment or state.awaitingSplit or state.awaitingRetry or state.awaitingMailClear then
         return
     end
 
@@ -753,6 +811,8 @@ local function LaunchSavedJob(job, label)
     state.splitBag = nil
     state.splitSlot = nil
     state.awaitingRetry = false
+    state.awaitingMailClear = false
+    state.mailClearStartedAt = nil
     state.mailRetryCount = 0
     state.recipients = CopyArray(job.recipients)
     state.itemID = job.itemID
@@ -995,6 +1055,8 @@ frame:SetScript("OnEvent", function(_, event, ...)
             state.splitBag = nil
             state.splitSlot = nil
             state.awaitingRetry = false
+            state.awaitingMailClear = false
+            state.mailClearStartedAt = nil
             SaveProgress("mailboxclosed")
             state.mailRetryCount = 0
             state.currentRecipient = nil
@@ -1008,6 +1070,11 @@ frame:SetScript("OnEvent", function(_, event, ...)
             local generation = state.generation
             C_Timer.After(STATE_POLL_INTERVAL, function()
                 VerifyAttachmentAndSend(generation)
+            end)
+        elseif state.running and state.awaitingMailClear then
+            local generation = state.generation
+            C_Timer.After(STATE_POLL_INTERVAL, function()
+                VerifyPreviousMailCleared(generation)
             end)
         end
 
@@ -1031,11 +1098,14 @@ frame:SetScript("OnEvent", function(_, event, ...)
 
         UpdatePanel()
 
+        -- Do not begin manipulating the next bag item immediately after a
+        -- successful send.  Give the compose UI a quiet period, then require
+        -- the previous attachment slot to be genuinely clear before continuing.
+        state.awaitingMailClear = true
+        state.mailClearStartedAt = GetTime()
         local generation = state.generation
-        C_Timer.After(NEXT_MAIL_DELAY, function()
-            if state.running and state.generation == generation then
-                SendNext()
-            end
+        C_Timer.After(GetNextMailDelay(), function()
+            VerifyPreviousMailCleared(generation)
         end)
 
     elseif event == "UI_ERROR_MESSAGE" then
