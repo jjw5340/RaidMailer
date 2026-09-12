@@ -1,4 +1,4 @@
-RaidMailer 0.2.0
+RaidMailer 0.2.1
 For WoW Burning Crusade Classic Anniversary 2.5.6 (Interface 20506)
 
 PURPOSE
@@ -33,7 +33,7 @@ USE
 4. The RaidMailer panel appears to the right.
 5. Click the Send button once.
 
-The addon sends one mail at a time. It waits for MAIL_SEND_SUCCESS before sending the next one and stops immediately on MAIL_FAILED.
+The addon sends one mail at a time. It waits for WoW to confirm the attachment state, then waits for MAIL_SEND_SUCCESS before sending the next one and stops immediately on MAIL_FAILED.
 
 SAFETY BEHAVIOR
 ---------------

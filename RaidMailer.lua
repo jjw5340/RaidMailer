@@ -27,6 +27,8 @@ local detailText
 local state = {
     running = false,
     awaitingResult = false,
+    awaitingAttachment = false,
+    attachmentVerifyAttempts = 0,
     recipients = {},
     index = 0,
     sent = 0,
@@ -247,6 +249,8 @@ local function StopRun(message, isError)
     state.generation = state.generation + 1
     state.running = false
     state.awaitingResult = false
+    state.awaitingAttachment = false
+    state.attachmentVerifyAttempts = 0
     state.currentRecipient = nil
     state.cancelRequested = false
 
@@ -265,13 +269,30 @@ local function StopRun(message, isError)
     end
 end
 
-local function AttachOneConfiguredItem()
+local SendNext
+local VerifyAttachmentAndSend
+
+local function BeginAttachOneConfiguredItem(generation, retries)
+    if generation ~= state.generation or not state.running or state.awaitingResult or state.awaitingAttachment then
+        return
+    end
+
     local bag, slot, stackCount, locked = FindConfiguredItemStack()
     if not bag then
-        if locked then
-            return false, "locked"
+        if locked and retries < 10 then
+            C_Timer.After(0.10, function()
+                BeginAttachOneConfiguredItem(generation, retries + 1)
+            end)
+            return
         end
-        return false, "missing"
+
+        local itemName = GetConfiguredItemName()
+        if locked then
+            StopRun("Stopped: the remaining " .. itemName .. " is still locked in your bags.", true)
+        else
+            StopRun("Stopped: no accessible " .. itemName .. " remains in your bags.", true)
+        end
+        return
     end
 
     ClearCursor()
@@ -291,57 +312,57 @@ local function AttachOneConfiguredItem()
     end
 
     if not CursorHasItem() then
-        return false, "cursor"
+        StopRun("Stopped: could not pick up a " .. GetConfiguredItemName() .. " from your bags.", true)
+        return
     end
+
+    -- MAIL_SEND_INFO_UPDATE may fire from inside ClickSendMailItemButton(),
+    -- so mark this state before dropping the cursor item into the mail slot.
+    state.awaitingAttachment = true
+    state.attachmentVerifyAttempts = 0
+    state.currentRecipient = state.recipients[state.index]
+    UpdatePanel()
 
     ClickSendMailItemButton(1)
 
-    local name, itemID, _, count = GetSendMailItem(1)
-    if not name or itemID ~= GetConfiguredItemID() or count ~= 1 then
-        ClearCursor()
-        ClearSendMail()
-        return false, "attachment"
-    end
-
-    return true
+    -- Fallback for clients/addon combinations where the attachment event is
+    -- swallowed or delivered before our handler can schedule verification.
+    C_Timer.After(0.05, function()
+        VerifyAttachmentAndSend(generation)
+    end)
 end
 
-local SendNext
-
-local function RetrySendNext(generation, retries)
-    if generation ~= state.generation or not state.running or state.awaitingResult then
+VerifyAttachmentAndSend = function(generation)
+    if generation ~= state.generation or not state.running or not state.awaitingAttachment or state.awaitingResult then
         return
     end
 
-    local ok, reason = AttachOneConfiguredItem()
-    if ok then
-        local recipient = state.recipients[state.index]
-        state.currentRecipient = recipient
+    local name, itemID, _, count = GetSendMailItem(1)
+    if name and itemID == GetConfiguredItemID() and count == 1 then
+        state.awaitingAttachment = false
+        state.attachmentVerifyAttempts = 0
         state.awaitingResult = true
         UpdatePanel()
-        SendMail(recipient, GetConfiguredItemName(), BODY)
+        SendMail(state.currentRecipient, GetConfiguredItemName(), BODY)
         return
     end
 
-    if reason == "locked" and retries < 10 then
-        C_Timer.After(0.10, function()
-            RetrySendNext(generation, retries + 1)
+    -- Attachment information can lag the cursor/drop operation by a frame or
+    -- two on Classic. Give WoW up to ~1 second to publish the final slot info.
+    state.attachmentVerifyAttempts = state.attachmentVerifyAttempts + 1
+    if state.attachmentVerifyAttempts < 20 then
+        C_Timer.After(0.05, function()
+            VerifyAttachmentAndSend(generation)
         end)
         return
     end
 
-    local itemName = GetConfiguredItemName()
-    if reason == "missing" then
-        StopRun("Stopped: no accessible " .. itemName .. " remains in your bags.", true)
-    elseif reason == "attachment" then
-        StopRun("Stopped: WoW did not attach exactly one " .. itemName .. ".", true)
-    else
-        StopRun("Stopped: could not pick up a " .. itemName .. " from your bags.", true)
-    end
+    ClearCursor()
+    StopRun("Stopped: WoW did not attach exactly one " .. GetConfiguredItemName() .. ".", true)
 end
 
 SendNext = function()
-    if not state.running or state.awaitingResult then
+    if not state.running or state.awaitingResult or state.awaitingAttachment then
         return
     end
 
@@ -359,7 +380,7 @@ SendNext = function()
     -- Each successful send should clear the compose state, but explicitly
     -- clear it here as well so every outgoing message starts from a known state.
     ClearSendMail()
-    RetrySendNext(state.generation, 0)
+    BeginAttachOneConfiguredItem(state.generation, 0)
 end
 
 local function StartRun()
@@ -398,6 +419,8 @@ local function StartRun()
     state.generation = state.generation + 1
     state.running = true
     state.awaitingResult = false
+    state.awaitingAttachment = false
+    state.attachmentVerifyAttempts = 0
     state.recipients = recipients
     state.index = 1
     state.sent = 0
@@ -472,6 +495,7 @@ end
 frame:RegisterEvent("MAIL_SHOW")
 frame:RegisterEvent("MAIL_CLOSED")
 frame:RegisterEvent("MAIL_SEND_SUCCESS")
+frame:RegisterEvent("MAIL_SEND_INFO_UPDATE")
 frame:RegisterEvent("MAIL_FAILED")
 frame:RegisterEvent("BAG_UPDATE_DELAYED")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
@@ -486,9 +510,19 @@ frame:SetScript("OnEvent", function(_, event)
             state.generation = state.generation + 1
             state.running = false
             state.awaitingResult = false
+            state.awaitingAttachment = false
+            state.attachmentVerifyAttempts = 0
             state.currentRecipient = nil
             state.cancelRequested = false
             Print("Stopped because the mailbox is no longer open.")
+        end
+
+    elseif event == "MAIL_SEND_INFO_UPDATE" then
+        if state.running and state.awaitingAttachment and not state.awaitingResult then
+            local generation = state.generation
+            C_Timer.After(0.01, function()
+                VerifyAttachmentAndSend(generation)
+            end)
         end
 
     elseif event == "MAIL_SEND_SUCCESS" then
