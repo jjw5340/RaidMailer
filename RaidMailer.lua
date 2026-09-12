@@ -1,8 +1,8 @@
 local ADDON_NAME = ...
 
 local BODY = ""
-local NEXT_MAIL_DELAY = 1.00
-local ATTACHMENT_SETTLE_DELAY = 0.50
+local NEXT_MAIL_DELAY = 0.25
+local ATTACHMENT_SETTLE_DELAY = 0.35
 local STATE_POLL_INTERVAL = 0.10
 local BAG_OPERATION_TIMEOUT = 12.0
 local ATTACHMENT_TIMEOUT = 12.0
@@ -14,14 +14,17 @@ local function GetConfiguredItemID()
     return RaidMailerConfig and tonumber(RaidMailerConfig.itemID) or nil
 end
 
-local function GetConfiguredItemName()
-    local itemID = GetConfiguredItemID()
+local function GetItemNameByID(itemID)
     if not itemID then
         return "configured item"
     end
 
     local name = GetItemInfo(itemID)
     return name or ("item " .. itemID)
+end
+
+local function GetConfiguredItemName()
+    return GetItemNameByID(GetConfiguredItemID())
 end
 
 local frame = CreateFrame("Frame")
@@ -43,6 +46,7 @@ local state = {
     awaitingRetry = false,
     mailRetryCount = 0,
     recipients = {},
+    itemID = nil,
     index = 0,
     sent = 0,
     currentRecipient = nil,
@@ -52,6 +56,81 @@ local state = {
 
 local function Print(message)
     DEFAULT_CHAT_FRAME:AddMessage("|cff9482c9RaidMailer:|r " .. tostring(message))
+end
+
+local function GetRunItemID()
+    return state.itemID or GetConfiguredItemID()
+end
+
+local function GetRunItemName()
+    return GetItemNameByID(GetRunItemID())
+end
+
+local function EnsureDB()
+    if type(RaidMailerDB) ~= "table" then
+        RaidMailerDB = {}
+    end
+end
+
+local function CopyArray(source)
+    local copy = {}
+    for i = 1, #source do
+        copy[i] = source[i]
+    end
+    return copy
+end
+
+local function GetSavedJob()
+    EnsureDB()
+    local job = RaidMailerDB.job
+    if type(job) ~= "table" or type(job.recipients) ~= "table" or type(job.itemID) ~= "number" then
+        RaidMailerDB.job = nil
+        return nil
+    end
+
+    local total = #job.recipients
+    local nextIndex = math.floor(tonumber(job.nextIndex) or 1)
+    if total == 0 or nextIndex < 1 or nextIndex > total then
+        RaidMailerDB.job = nil
+        return nil
+    end
+
+    job.nextIndex = nextIndex
+    job.sent = math.max(0, math.min(total, tonumber(job.sent) or (nextIndex - 1)))
+    return job
+end
+
+local function CreateSavedJob(itemID, recipients)
+    EnsureDB()
+    RaidMailerDB.job = {
+        version = 1,
+        itemID = itemID,
+        recipients = CopyArray(recipients),
+        nextIndex = 1,
+        sent = 0,
+        createdAt = time and time() or 0,
+        updatedAt = time and time() or 0,
+        pausedReason = nil,
+    }
+    return RaidMailerDB.job
+end
+
+local function SaveProgress(pausedReason)
+    EnsureDB()
+    local job = RaidMailerDB.job
+    if type(job) ~= "table" then
+        return
+    end
+
+    job.nextIndex = state.index
+    job.sent = state.sent
+    job.updatedAt = time and time() or 0
+    job.pausedReason = pausedReason
+end
+
+local function ClearSavedJob()
+    EnsureDB()
+    RaidMailerDB.job = nil
 end
 
 local function Trim(text)
@@ -136,8 +215,7 @@ local function GetNumSlots(bag)
     return GetContainerNumSlots(bag)
 end
 
-local function CountConfiguredItemsInBags()
-    local itemID = GetConfiguredItemID()
+local function CountItemInBags(itemID)
     if not itemID then return 0 end
 
     local total = 0
@@ -152,8 +230,12 @@ local function CountConfiguredItemsInBags()
     return total
 end
 
+local function CountConfiguredItemsInBags()
+    return CountItemInBags(GetConfiguredItemID())
+end
+
 local function FindConfiguredSingleton()
-    local itemID = GetConfiguredItemID()
+    local itemID = GetRunItemID()
     if not itemID then return nil, nil, false end
 
     local foundLocked = false
@@ -175,7 +257,7 @@ local function FindConfiguredSingleton()
 end
 
 local function FindConfiguredLargeStack()
-    local itemID = GetConfiguredItemID()
+    local itemID = GetRunItemID()
     if not itemID then return nil, nil, nil, false end
 
     local foundLocked = false
@@ -270,13 +352,15 @@ local function UpdatePanel()
     if not panel then return end
 
     local itemID = GetConfiguredItemID()
-    local itemName = GetConfiguredItemName()
+    local itemName = GetRunItemName()
     local recipients, duplicates, skippedSelf = ParseRecipients()
     local items = CountConfiguredItemsInBags()
+    local savedJob = GetSavedJob()
 
     if state.running then
         sendButton:SetText("Sending...")
         sendButton:Disable()
+        cancelButton:SetText("Cancel")
         cancelButton:Enable()
 
         local total = #state.recipients
@@ -288,12 +372,40 @@ local function UpdatePanel()
         else
             statusText:SetText(string.format("Sent %d/%d", state.sent, total))
         end
-        detailText:SetText(string.format("%s remaining: %d", itemName, items))
+        detailText:SetText(string.format("%s remaining: %d", GetRunItemName(), CountItemInBags(GetRunItemID())))
         return
     end
 
-    sendButton:SetText(string.format("Send Items (%d)", #recipients))
+    if savedJob then
+        local total = #savedJob.recipients
+        local sent = savedJob.nextIndex - 1
+        local remaining = total - sent
+        local savedItemName = GetItemNameByID(savedJob.itemID)
+        local nextRecipient = savedJob.recipients[savedJob.nextIndex] or "?"
+
+        sendButton:SetText(string.format("Resume (%d left)", remaining))
+        cancelButton:SetText("Restart")
+        cancelButton:Enable()
+
+        if savedJob.pausedReason == "mailcap" then
+            statusText:SetText(string.format("Paused: mail cap (%d/%d sent)", sent, total))
+        else
+            statusText:SetText(string.format("Paused: %d/%d sent", sent, total))
+        end
+        detailText:SetText(string.format("Next: %s. %d %s in bags.", nextRecipient, CountItemInBags(savedJob.itemID), savedItemName))
+
+        if CountItemInBags(savedJob.itemID) < remaining then
+            sendButton:Disable()
+            detailText:SetText(string.format("Next: %s. Need %d more %s to finish.", nextRecipient, remaining, savedItemName))
+        else
+            sendButton:Enable()
+        end
+        return
+    end
+
+    cancelButton:SetText("Cancel")
     cancelButton:Disable()
+    sendButton:SetText(string.format("Send Items (%d)", #recipients))
 
     if not itemID or itemID <= 0 or itemID ~= math.floor(itemID) then
         statusText:SetText("Invalid item configuration")
@@ -335,6 +447,7 @@ local function StopRun(message, isError)
     state.awaitingRetry = false
     state.mailRetryCount = 0
     state.currentRecipient = nil
+    state.itemID = nil
     state.cancelRequested = false
 
     ClearCursor()
@@ -365,7 +478,7 @@ local function AttachSingletonFromBag(generation, bag, slot, lockStartedAt)
     end
 
     local info = GetContainerInfo(bag, slot)
-    if not info or info.itemID ~= GetConfiguredItemID() or (info.stackCount or 0) ~= 1 then
+    if not info or info.itemID ~= GetRunItemID() or (info.stackCount or 0) ~= 1 then
         StopRun("Stopped: the prepared 1-item stack is no longer available.", true)
         return
     end
@@ -379,7 +492,7 @@ local function AttachSingletonFromBag(generation, bag, slot, lockStartedAt)
             return
         end
 
-        StopRun("Stopped: the prepared 1-item " .. GetConfiguredItemName() .. " stack remained locked for more than " .. ITEM_LOCK_TIMEOUT .. " seconds.", true)
+        StopRun("Stopped: the prepared 1-item " .. GetRunItemName() .. " stack remained locked for more than " .. ITEM_LOCK_TIMEOUT .. " seconds.", true)
         return
     end
 
@@ -387,7 +500,7 @@ local function AttachSingletonFromBag(generation, bag, slot, lockStartedAt)
     PickupContainerSlot(bag, slot)
 
     if not CursorHasItem() then
-        StopRun("Stopped: could not pick up a single " .. GetConfiguredItemName() .. " from your bags.", true)
+        StopRun("Stopped: could not pick up a single " .. GetRunItemName() .. " from your bags.", true)
         return
     end
 
@@ -408,7 +521,7 @@ end
 local function PrepareOneItemInBag(generation, sourceBag, sourceSlot)
     local emptyBag, emptySlot = FindEmptyGeneralBagSlot()
     if not emptyBag then
-        StopRun("Stopped: RaidMailer needs one empty slot in the backpack or an ordinary bag to split " .. GetConfiguredItemName() .. ".", true)
+        StopRun("Stopped: RaidMailer needs one empty slot in the backpack or an ordinary bag to split " .. GetRunItemName() .. ".", true)
         return
     end
 
@@ -416,7 +529,7 @@ local function PrepareOneItemInBag(generation, sourceBag, sourceSlot)
     SplitContainerStack(sourceBag, sourceSlot, 1)
 
     if not CursorHasItem() then
-        StopRun("Stopped: could not split one " .. GetConfiguredItemName() .. " from the source stack.", true)
+        StopRun("Stopped: could not split one " .. GetRunItemName() .. " from the source stack.", true)
         return
     end
 
@@ -426,7 +539,7 @@ local function PrepareOneItemInBag(generation, sourceBag, sourceSlot)
 
     if CursorHasItem() then
         ClearCursor()
-        StopRun("Stopped: could not place the split " .. GetConfiguredItemName() .. " into an empty bag slot.", true)
+        StopRun("Stopped: could not place the split " .. GetRunItemName() .. " into an empty bag slot.", true)
         return
     end
 
@@ -473,7 +586,7 @@ local function BeginAttachOneConfiguredItem(generation, lockStartedAt)
         end
     end
 
-    local itemName = GetConfiguredItemName()
+    local itemName = GetRunItemName()
     if singleLocked or largeLocked then
         StopRun("Stopped: the remaining " .. itemName .. " stayed locked for more than " .. ITEM_LOCK_TIMEOUT .. " seconds.", true)
     else
@@ -489,7 +602,7 @@ VerifySplitAndAttach = function(generation)
     local bag, slot = state.splitBag, state.splitSlot
     local info = bag and slot and GetContainerInfo(bag, slot) or nil
 
-    if info and info.itemID == GetConfiguredItemID() and (info.stackCount or 0) == 1 and not info.isLocked then
+    if info and info.itemID == GetRunItemID() and (info.stackCount or 0) == 1 and not info.isLocked then
         state.awaitingSplit = false
         state.splitStartedAt = nil
         state.splitBag = nil
@@ -512,7 +625,7 @@ VerifySplitAndAttach = function(generation)
         return
     end
 
-    StopRun("Stopped: WoW did not finish creating the 1-item " .. GetConfiguredItemName() .. " stack within " .. BAG_OPERATION_TIMEOUT .. " seconds.", true)
+    StopRun("Stopped: WoW did not finish creating the 1-item " .. GetRunItemName() .. " stack within " .. BAG_OPERATION_TIMEOUT .. " seconds.", true)
 end
 
 local function SendCurrentMail(generation)
@@ -524,7 +637,7 @@ local function SendCurrentMail(generation)
     state.attachmentStartedAt = nil
     state.awaitingResult = true
     UpdatePanel()
-    SendMail(state.currentRecipient, GetConfiguredItemName(), BODY)
+    SendMail(state.currentRecipient, GetRunItemName(), BODY)
 end
 
 VerifyAttachmentAndSend = function(generation)
@@ -533,7 +646,7 @@ VerifyAttachmentAndSend = function(generation)
     end
 
     local name, itemID, _, count = GetSendMailItem(1)
-    if name and itemID == GetConfiguredItemID() and count == 1 then
+    if name and itemID == GetRunItemID() and count == 1 then
         -- GetSendMailItem() can become readable slightly before the mail UI/server
         -- is fully settled.  Stop further attachment verification now, then
         -- give WoW a short quiet period before calling SendMail().
@@ -555,7 +668,7 @@ VerifyAttachmentAndSend = function(generation)
     end
 
     ClearCursor()
-    StopRun("Stopped: WoW did not attach exactly one " .. GetConfiguredItemName() .. " within " .. ATTACHMENT_TIMEOUT .. " seconds.", true)
+    StopRun("Stopped: WoW did not attach exactly one " .. GetRunItemName() .. " within " .. ATTACHMENT_TIMEOUT .. " seconds.", true)
 end
 
 RetryCurrentMail = function(generation)
@@ -568,7 +681,7 @@ RetryCurrentMail = function(generation)
     -- A failed SendMail attempt normally leaves the attachment in the compose
     -- window.  Reuse it when it is still exactly the configured singleton.
     local name, itemID, _, count = GetSendMailItem(1)
-    if name and itemID == GetConfiguredItemID() and count == 1 then
+    if name and itemID == GetRunItemID() and count == 1 then
         SendCurrentMail(generation)
         return
     end
@@ -592,7 +705,9 @@ SendNext = function()
 
     if state.index > #state.recipients then
         local sent = state.sent
-        StopRun(string.format("Complete: sent %d item%s (%s).", sent, sent == 1 and "" or "s", GetConfiguredItemName()), false)
+        local itemName = GetRunItemName()
+        ClearSavedJob()
+        StopRun(string.format("Complete: sent %d item%s (%s).", sent, sent == 1 and "" or "s", itemName), false)
         return
     end
 
@@ -602,36 +717,29 @@ SendNext = function()
     BeginAttachOneConfiguredItem(state.generation, GetTime())
 end
 
-local function StartRun()
-    if state.running then return end
-
-    local itemID = GetConfiguredItemID()
-    if not itemID or itemID <= 0 or itemID ~= math.floor(itemID) then
-        Print("Cannot start: set a valid numeric itemID in RaidMailerConfig.lua.")
-        return
-    end
-
-    local recipients, duplicates, skippedSelf = ParseRecipients()
-
-    if #duplicates > 0 then
-        Print("Cannot start: duplicate recipient(s): " .. table.concat(duplicates, ", "))
-        return
-    end
-
-    if #recipients == 0 then
-        Print("Cannot start: no recipients are configured in RaidMailerConfig.lua.")
-        return
+local function ValidateMailboxReady()
+    if not MailFrame or not MailFrame:IsShown() then
+        Print("Open a mailbox and select the Send Mail tab first.")
+        return false
     end
 
     local hasDraft, draftPart = HasExistingDraft()
     if hasDraft then
         Print("Cannot start while the normal Send Mail window contains " .. draftPart .. ". Clear the draft first.")
-        return
+        return false
     end
 
-    local items = CountConfiguredItemsInBags()
-    if items < #recipients then
-        Print(string.format("Cannot start: need %d %s but only %d are in your bags.", #recipients, GetConfiguredItemName(), items))
+    return true
+end
+
+local function LaunchSavedJob(job, label)
+    if state.running or not job then return end
+    if not ValidateMailboxReady() then return end
+
+    local remaining = #job.recipients - job.nextIndex + 1
+    local items = CountItemInBags(job.itemID)
+    if items < remaining then
+        Print(string.format("Cannot resume: need %d %s but only %d are in your bags.", remaining, GetItemNameByID(job.itemID), items))
         return
     end
 
@@ -646,15 +754,95 @@ local function StartRun()
     state.splitSlot = nil
     state.awaitingRetry = false
     state.mailRetryCount = 0
-    state.recipients = recipients
-    state.index = 1
-    state.sent = 0
+    state.recipients = CopyArray(job.recipients)
+    state.itemID = job.itemID
+    state.index = job.nextIndex
+    state.sent = job.nextIndex - 1
     state.currentRecipient = nil
     state.cancelRequested = false
 
-    Print(string.format("Starting: %d recipient%s%s.", #recipients, #recipients == 1 and "" or "s", skippedSelf > 0 and " (your character skipped)" or ""))
+    SaveProgress(nil)
+    Print(string.format("%s: %d/%d already sent; %d remaining. Next: %s.", label, state.sent, #state.recipients, remaining, state.recipients[state.index]))
     UpdatePanel()
     SendNext()
+end
+
+local function StartFreshRun()
+    if state.running then return end
+
+    local itemID = GetConfiguredItemID()
+    if not itemID or itemID <= 0 or itemID ~= math.floor(itemID) then
+        Print("Cannot start: set a valid numeric itemID in RaidMailerConfig.lua.")
+        return
+    end
+
+    local recipients, duplicates, skippedSelf = ParseRecipients()
+    if #duplicates > 0 then
+        Print("Cannot start: duplicate recipient(s): " .. table.concat(duplicates, ", "))
+        return
+    end
+
+    if #recipients == 0 then
+        Print("Cannot start: no recipients are configured in RaidMailerConfig.lua.")
+        return
+    end
+
+    if not ValidateMailboxReady() then return end
+
+    local items = CountItemInBags(itemID)
+    if items < #recipients then
+        Print(string.format("Cannot start: need %d %s but only %d are in your bags.", #recipients, GetItemNameByID(itemID), items))
+        return
+    end
+
+    local job = CreateSavedJob(itemID, recipients)
+    local suffix = skippedSelf > 0 and " (your character skipped)" or ""
+    Print(string.format("Starting new batch: %d recipient%s%s.", #recipients, #recipients == 1 and "" or "s", suffix))
+    LaunchSavedJob(job, "Batch started")
+end
+
+local function ResumeRun()
+    if state.running then return end
+    local job = GetSavedJob()
+    if not job then
+        Print("No saved batch is waiting to resume.")
+        return
+    end
+    LaunchSavedJob(job, "Resuming")
+end
+
+local function StartOrResume()
+    if GetSavedJob() then
+        ResumeRun()
+    else
+        StartFreshRun()
+    end
+end
+
+local function RestartRun()
+    if state.running then return end
+    local job = GetSavedJob()
+    if job then
+        Print(string.format("Restarting from the beginning; the new batch will replace progress for %d previously sent recipient%s.", job.nextIndex - 1, (job.nextIndex - 1) == 1 and "" or "s"))
+    end
+    -- StartFreshRun validates the current config and item count before
+    -- CreateSavedJob replaces the old checkpoint.  If validation fails, the
+    -- existing resumable job is left intact.
+    StartFreshRun()
+end
+
+local function ResetSavedRun()
+    if state.running then
+        Print("Cannot reset saved progress while a batch is running. Cancel it first.")
+        return
+    end
+    if GetSavedJob() then
+        ClearSavedJob()
+        UpdatePanel()
+        Print("Saved batch progress cleared.")
+    else
+        Print("No saved batch progress to clear.")
+    end
 end
 
 local function CancelRun()
@@ -668,8 +856,34 @@ local function CancelRun()
         if statusText then statusText:SetText("Stopping after current mail...") end
         Print("Stopping after the current mail finishes.")
     else
-        StopRun("Cancelled.", false)
+        SaveProgress("cancelled")
+        StopRun("Paused. Use /rm resume or the Resume button to continue.", false)
     end
+end
+
+local function ConfirmRestartRun()
+    local job = GetSavedJob()
+    if not job then
+        StartFreshRun()
+        return
+    end
+
+    if not StaticPopupDialogs["RAIDMAILER_RESTART_CONFIRM"] then
+        StaticPopupDialogs["RAIDMAILER_RESTART_CONFIRM"] = {
+            text = "RaidMailer has already sent %d of %d mails. Restarting may send duplicate items to those recipients. Restart from the beginning?",
+            button1 = YES,
+            button2 = CANCEL,
+            OnAccept = function(_, data)
+                RestartRun()
+            end,
+            timeout = 0,
+            whileDead = true,
+            hideOnEscape = true,
+            preferredIndex = 3,
+        }
+    end
+
+    StaticPopup_Show("RAIDMAILER_RESTART_CONFIRM", job.nextIndex - 1, #job.recipients)
 end
 
 local function CreatePanel()
@@ -705,16 +919,47 @@ local function CreatePanel()
     sendButton = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
     sendButton:SetSize(145, 24)
     sendButton:SetPoint("BOTTOMLEFT", 12, 12)
-    sendButton:SetScript("OnClick", StartRun)
+    sendButton:SetScript("OnClick", function()
+        if state.running then return end
+        StartOrResume()
+    end)
 
     cancelButton = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
     cancelButton:SetSize(78, 24)
     cancelButton:SetPoint("LEFT", sendButton, "RIGHT", 8, 0)
     cancelButton:SetText("Cancel")
-    cancelButton:SetScript("OnClick", CancelRun)
+    cancelButton:SetScript("OnClick", function()
+        if state.running then
+            CancelRun()
+        elseif GetSavedJob() then
+            ConfirmRestartRun()
+        end
+    end)
     cancelButton:Disable()
 
     UpdatePanel()
+end
+
+local function IsMailRecipientCapError(errorType, message)
+    if GetGameMessageInfo and errorType then
+        local stringID = GetGameMessageInfo(errorType)
+        if stringID == "ERR_MAIL_REACHED_CAP" then
+            return true
+        end
+    end
+
+    if ERR_MAIL_REACHED_CAP and message == ERR_MAIL_REACHED_CAP then
+        return true
+    end
+
+    return message == "You have reached the in-game cap of unique mail recipients"
+end
+
+local function PauseForMailCap()
+    if not state.running then return end
+    local recipient = state.currentRecipient or state.recipients[state.index] or "next recipient"
+    SaveProgress("mailcap")
+    StopRun("Paused before " .. recipient .. ": WoW's unique mail recipient cap was reached. No further mail was sent. Resume this saved batch later with /rm resume or the Resume button.", true)
 end
 
 frame:RegisterEvent("MAIL_SHOW")
@@ -724,9 +969,17 @@ frame:RegisterEvent("MAIL_SEND_INFO_UPDATE")
 frame:RegisterEvent("MAIL_FAILED")
 frame:RegisterEvent("BAG_UPDATE_DELAYED")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+frame:RegisterEvent("UI_ERROR_MESSAGE")
+frame:RegisterEvent("ADDON_LOADED")
 
-frame:SetScript("OnEvent", function(_, event)
-    if event == "MAIL_SHOW" then
+frame:SetScript("OnEvent", function(_, event, ...)
+    if event == "ADDON_LOADED" then
+        local loadedAddon = ...
+        if loadedAddon == ADDON_NAME then
+            EnsureDB()
+        end
+
+    elseif event == "MAIL_SHOW" then
         CreatePanel()
         UpdatePanel()
 
@@ -742,10 +995,12 @@ frame:SetScript("OnEvent", function(_, event)
             state.splitBag = nil
             state.splitSlot = nil
             state.awaitingRetry = false
+            SaveProgress("mailboxclosed")
             state.mailRetryCount = 0
             state.currentRecipient = nil
+            state.itemID = nil
             state.cancelRequested = false
-            Print("Stopped because the mailbox is no longer open.")
+            Print("Paused because the mailbox is no longer open. Reopen a mailbox and use Resume to continue.")
         end
 
     elseif event == "MAIL_SEND_INFO_UPDATE" then
@@ -766,9 +1021,11 @@ frame:SetScript("OnEvent", function(_, event)
         state.sent = state.sent + 1
         state.index = state.index + 1
         state.currentRecipient = nil
+        SaveProgress(nil)
 
         if state.cancelRequested then
-            StopRun(string.format("Cancelled after sending %d mail%s.", state.sent, state.sent == 1 and "" or "s"), false)
+            SaveProgress("cancelled")
+            StopRun(string.format("Paused after sending %d mail%s. Use /rm resume to continue.", state.sent, state.sent == 1 and "" or "s"), false)
             return
         end
 
@@ -780,6 +1037,12 @@ frame:SetScript("OnEvent", function(_, event)
                 SendNext()
             end
         end)
+
+    elseif event == "UI_ERROR_MESSAGE" then
+        local errorType, message = ...
+        if state.running and IsMailRecipientCapError(errorType, message) then
+            PauseForMailCap()
+        end
 
     elseif event == "MAIL_FAILED" then
         if state.running and state.awaitingResult then
@@ -819,12 +1082,27 @@ SlashCmdList.RAIDMAILER = function(msg)
     msg = Trim((msg or ""):lower())
 
     if msg == "send" then
-        StartRun()
+        StartOrResume()
+    elseif msg == "resume" then
+        ResumeRun()
+    elseif msg == "restart" then
+        RestartRun()
+    elseif msg == "reset" then
+        ResetSavedRun()
     elseif msg == "cancel" or msg == "stop" then
         CancelRun()
     else
-        local recipients, duplicates, skippedSelf = ParseRecipients()
-        Print(string.format("Item: %s. %d recipient(s), %d in bags, %d duplicate(s), %d self entry/entries skipped.", GetConfiguredItemName(), #recipients, CountConfiguredItemsInBags(), #duplicates, skippedSelf))
-        Print("Open a mailbox, select the Send Mail tab, and use the RaidMailer panel. Commands: /rm send, /rm cancel")
+        local savedJob = GetSavedJob()
+        if savedJob then
+            local total = #savedJob.recipients
+            local sent = savedJob.nextIndex - 1
+            local remaining = total - sent
+            Print(string.format("Saved batch: %s. %d/%d sent, %d remaining. Next: %s.", GetItemNameByID(savedJob.itemID), sent, total, remaining, savedJob.recipients[savedJob.nextIndex]))
+            Print("Commands: /rm resume, /rm restart, /rm reset, /rm cancel")
+        else
+            local recipients, duplicates, skippedSelf = ParseRecipients()
+            Print(string.format("Item: %s. %d recipient(s), %d in bags, %d duplicate(s), %d self entry/entries skipped.", GetConfiguredItemName(), #recipients, CountConfiguredItemsInBags(), #duplicates, skippedSelf))
+            Print("Open a mailbox, select the Send Mail tab, and use the RaidMailer panel. Commands: /rm send, /rm resume, /rm restart, /rm reset, /rm cancel")
+        end
     end
 end
