@@ -24,9 +24,10 @@ The resulting folder should contain:
 
 ```text
 RaidMailer\
+├── LICENSE
+├── README.md
 ├── RaidMailer.lua
-├── RaidMailer.toc
-└── README.md
+└── RaidMailer.toc
 ```
 
 ## In-Game Configuration
@@ -61,8 +62,8 @@ RaidMailer uses two SavedVariables databases:
 
 ```lua
 RaidMailerSettingsDB = {
-    panelOffsetX = 8,
-    panelOffsetY = -32,
+    panelOffsetX = 25,
+    panelOffsetY = 0,
     interMailDelay = 1.0,
 }
 ```
