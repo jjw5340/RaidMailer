@@ -6,5 +6,4 @@
 ## SavedVariables: RaidMailerSettingsDB
 ## SavedVariablesPerCharacter: RaidMailerDB
 
-RaidMailerConfig.lua
 RaidMailer.lua

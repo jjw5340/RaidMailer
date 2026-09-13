@@ -5,6 +5,10 @@ local DEFAULT_NEXT_MAIL_DELAY = 1.00
 local DEFAULT_PANEL_OFFSET_X = 8
 local DEFAULT_PANEL_OFFSET_Y = -32
 local DEFAULT_QUANTITY = 1
+local PANEL_WIDTH = 350
+local FALLBACK_PANEL_HEIGHT = 512
+local RECIPIENTS_VISIBLE_HEIGHT = 154
+local RECIPIENTS_EDIT_MIN_HEIGHT = 145
 local ATTACHMENT_SETTLE_DELAY = 0.35
 local MAIL_CLEAR_TIMEOUT = 12.0
 local STATE_POLL_INTERVAL = 0.10
@@ -87,16 +91,12 @@ local function EnsureDatabases()
         RaidMailerSettingsDB = {}
     end
 
-    local legacy = type(RaidMailerConfig) == "table" and RaidMailerConfig or nil
-    local migratedLegacyConfig = false
-
     if type(RaidMailerDB.config) ~= "table" then
         RaidMailerDB.config = {
             quantity = DEFAULT_QUANTITY,
-            itemID = legacy and tonumber(legacy.itemID) or nil,
-            recipients = legacy and NormalizeRecipientText(legacy.recipients) or "",
+            itemID = nil,
+            recipients = "",
         }
-        migratedLegacyConfig = legacy ~= nil
     end
 
     local config = RaidMailerDB.config
@@ -116,13 +116,13 @@ local function EnsureDatabases()
     config.recipients = NormalizeRecipientText(config.recipients)
 
     if RaidMailerSettingsDB.interMailDelay == nil then
-        RaidMailerSettingsDB.interMailDelay = legacy and tonumber(legacy.interMailDelay) or DEFAULT_NEXT_MAIL_DELAY
+        RaidMailerSettingsDB.interMailDelay = DEFAULT_NEXT_MAIL_DELAY
     end
     if RaidMailerSettingsDB.panelOffsetX == nil then
-        RaidMailerSettingsDB.panelOffsetX = legacy and tonumber(legacy.panelOffsetX) or DEFAULT_PANEL_OFFSET_X
+        RaidMailerSettingsDB.panelOffsetX = DEFAULT_PANEL_OFFSET_X
     end
     if RaidMailerSettingsDB.panelOffsetY == nil then
-        RaidMailerSettingsDB.panelOffsetY = legacy and tonumber(legacy.panelOffsetY) or DEFAULT_PANEL_OFFSET_Y
+        RaidMailerSettingsDB.panelOffsetY = DEFAULT_PANEL_OFFSET_Y
     end
 
     local delay = tonumber(RaidMailerSettingsDB.interMailDelay) or DEFAULT_NEXT_MAIL_DELAY
@@ -132,12 +132,6 @@ local function EnsureDatabases()
 
     RaidMailerDB.schemaVersion = 2
     RaidMailerSettingsDB.schemaVersion = 1
-
-    if migratedLegacyConfig then
-        RaidMailerDB.legacyConfigMigrated = true
-    end
-
-    return migratedLegacyConfig
 end
 
 local function GetSavedConfig()
@@ -471,6 +465,12 @@ end
 
 local function ApplyPanelPosition()
     if not panel or not MailFrame then return end
+    local mailFrameHeight = MailFrame:GetHeight()
+    if mailFrameHeight and mailFrameHeight > 0 then
+        panel:SetHeight(mailFrameHeight)
+    else
+        panel:SetHeight(FALLBACK_PANEL_HEIGHT)
+    end
     panel:ClearAllPoints()
     panel:SetPoint("TOPLEFT", MailFrame, "TOPRIGHT", GetPanelOffsetX(), GetPanelOffsetY())
 end
@@ -516,7 +516,7 @@ local function UpdateRecipientEditHeight()
     local text = NormalizeRecipientText(recipientsEdit:GetText())
     local _, newlineCount = text:gsub("\n", "\n")
     local lineCount = math.max(1, newlineCount + 1)
-    recipientsEdit:SetHeight(math.max(236, lineCount * 14 + 12))
+    recipientsEdit:SetHeight(math.max(RECIPIENTS_EDIT_MIN_HEIGHT, lineCount * 14 + 12))
     if recipientsScrollFrame.UpdateScrollChildRect then
         recipientsScrollFrame:UpdateScrollChildRect()
     end
@@ -673,19 +673,19 @@ local function CreateSettingsWindow()
     hint:SetJustifyH("LEFT")
     hint:SetText("Positive X moves the mailbox panel right; positive Y moves it up. Settings are shared across characters.")
 
-    settingsSaveButton = CreateFrame("Button", nil, settingsFrame, "UIPanelButtonTemplate")
-    settingsSaveButton:SetSize(90, 24)
-    settingsSaveButton:SetPoint("BOTTOMRIGHT", -18, 16)
-    settingsSaveButton:SetText("Save")
-    settingsSaveButton:SetScript("OnClick", SaveSettingsFromUI)
-
     settingsRevertButton = CreateFrame("Button", nil, settingsFrame, "UIPanelButtonTemplate")
     settingsRevertButton:SetSize(90, 24)
-    settingsRevertButton:SetPoint("RIGHT", settingsSaveButton, "LEFT", -8, 0)
+    settingsRevertButton:SetPoint("BOTTOMRIGHT", -18, 16)
     settingsRevertButton:SetText("Revert")
     settingsRevertButton:SetScript("OnClick", function()
         LoadSettingsIntoWindow()
     end)
+
+    settingsSaveButton = CreateFrame("Button", nil, settingsFrame, "UIPanelButtonTemplate")
+    settingsSaveButton:SetSize(90, 24)
+    settingsSaveButton:SetPoint("RIGHT", settingsRevertButton, "LEFT", -8, 0)
+    settingsSaveButton:SetText("Save")
+    settingsSaveButton:SetScript("OnClick", SaveSettingsFromUI)
 
     if UISpecialFrames then
         table.insert(UISpecialFrames, "RaidMailerSettingsFrame")
@@ -1325,7 +1325,7 @@ local function CreatePanel()
     if panel or not SendMailFrame then return end
 
     panel = CreateFrame("Frame", "RaidMailerPanel", SendMailFrame, "BackdropTemplate")
-    panel:SetSize(350, 535)
+    panel:SetSize(PANEL_WIDTH, (MailFrame and MailFrame:GetHeight()) or FALLBACK_PANEL_HEIGHT)
     ApplyPanelPosition()
     panel:SetBackdrop({
         bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
@@ -1348,10 +1348,10 @@ local function CreatePanel()
 
     local quantityLabel = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     quantityLabel:SetPoint("TOPLEFT", 16, -47)
-    quantityLabel:SetText("Quantity / mail")
+    quantityLabel:SetText("Qty")
 
     quantityEdit = CreateFrame("EditBox", nil, panel, "InputBoxTemplate")
-    quantityEdit:SetSize(90, 22)
+    quantityEdit:SetSize(54, 22)
     quantityEdit:SetPoint("TOPLEFT", 16, -64)
     quantityEdit:SetAutoFocus(false)
     quantityEdit:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
@@ -1361,12 +1361,12 @@ local function CreatePanel()
     end)
 
     local itemLabel = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    itemLabel:SetPoint("TOPLEFT", 130, -47)
+    itemLabel:SetPoint("TOPLEFT", 88, -47)
     itemLabel:SetText("Item ID")
 
     itemIDEdit = CreateFrame("EditBox", nil, panel, "InputBoxTemplate")
     itemIDEdit:SetSize(110, 22)
-    itemIDEdit:SetPoint("TOPLEFT", 130, -64)
+    itemIDEdit:SetPoint("TOPLEFT", 88, -64)
     itemIDEdit:SetAutoFocus(false)
     itemIDEdit:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
     itemIDEdit:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
@@ -1387,7 +1387,7 @@ local function CreatePanel()
     local recipientsBorder = CreateFrame("Frame", nil, panel, "BackdropTemplate")
     recipientsBorder:SetPoint("TOPLEFT", 14, -116)
     recipientsBorder:SetPoint("TOPRIGHT", -14, -116)
-    recipientsBorder:SetHeight(245)
+    recipientsBorder:SetHeight(RECIPIENTS_VISIBLE_HEIGHT)
     recipientsBorder:SetBackdrop({
         bgFile = "Interface\\Buttons\\WHITE8X8",
         edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
@@ -1406,10 +1406,18 @@ local function CreatePanel()
     recipientsEdit:SetAutoFocus(false)
     recipientsEdit:SetFontObject(ChatFontNormal)
     recipientsEdit:SetWidth(280)
-    recipientsEdit:SetHeight(236)
+    recipientsEdit:SetHeight(RECIPIENTS_EDIT_MIN_HEIGHT)
     recipientsEdit:SetJustifyH("LEFT")
     recipientsEdit:SetJustifyV("TOP")
     recipientsEdit:SetMaxLetters(8192)
+    recipientsEdit:SetBlinkSpeed(0.5)
+    recipientsEdit:SetTextInsets(1, 1, 1, 1)
+    recipientsEdit:SetScript("OnEditFocusGained", function()
+        recipientsBorder:SetBackdropBorderColor(0.95, 0.82, 0.25, 1.0)
+    end)
+    recipientsEdit:SetScript("OnEditFocusLost", function()
+        recipientsBorder:SetBackdropBorderColor(1, 1, 1, 1)
+    end)
     recipientsEdit:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
     recipientsEdit:SetScript("OnTextChanged", function()
         UpdateRecipientEditHeight()
@@ -1417,34 +1425,17 @@ local function CreatePanel()
     end)
     recipientsScrollFrame:SetScrollChild(recipientsEdit)
 
-    configSaveButton = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
-    configSaveButton:SetSize(82, 23)
-    configSaveButton:SetPoint("TOPRIGHT", recipientsBorder, "BOTTOMRIGHT", 0, -8)
-    configSaveButton:SetText("Save")
-    configSaveButton:SetScript("OnClick", SaveDistributionConfigFromUI)
-
     configRevertButton = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
-    configRevertButton:SetSize(82, 23)
-    configRevertButton:SetPoint("RIGHT", configSaveButton, "LEFT", -8, 0)
+    configRevertButton:SetSize(104, 23)
+    configRevertButton:SetPoint("TOPRIGHT", recipientsBorder, "BOTTOMRIGHT", 0, -8)
     configRevertButton:SetText("Revert")
     configRevertButton:SetScript("OnClick", LoadConfigIntoPanelFields)
 
-    local separator = panel:CreateTexture(nil, "ARTWORK")
-    separator:SetColorTexture(0.35, 0.35, 0.35, 0.7)
-    separator:SetPoint("TOPLEFT", 14, -407)
-    separator:SetPoint("TOPRIGHT", -14, -407)
-    separator:SetHeight(1)
-
-    statusText = panel:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    statusText:SetPoint("TOPLEFT", 16, -421)
-    statusText:SetPoint("TOPRIGHT", -16, -421)
-    statusText:SetJustifyH("LEFT")
-
-    detailText = panel:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-    detailText:SetPoint("TOPLEFT", statusText, "BOTTOMLEFT", 0, -5)
-    detailText:SetPoint("TOPRIGHT", statusText, "BOTTOMRIGHT", 0, -5)
-    detailText:SetJustifyH("LEFT")
-    detailText:SetWordWrap(true)
+    configSaveButton = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+    configSaveButton:SetSize(82, 23)
+    configSaveButton:SetPoint("RIGHT", configRevertButton, "LEFT", -8, 0)
+    configSaveButton:SetText("Save")
+    configSaveButton:SetScript("OnClick", SaveDistributionConfigFromUI)
 
     sendButton = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
     sendButton:SetSize(210, 25)
@@ -1466,6 +1457,23 @@ local function CreatePanel()
         end
     end)
     cancelButton:Disable()
+
+    detailText = panel:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    detailText:SetPoint("BOTTOMLEFT", sendButton, "TOPLEFT", 2, 12)
+    detailText:SetPoint("BOTTOMRIGHT", cancelButton, "TOPRIGHT", -2, 12)
+    detailText:SetJustifyH("LEFT")
+    detailText:SetWordWrap(true)
+
+    statusText = panel:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    statusText:SetPoint("BOTTOMLEFT", detailText, "TOPLEFT", 0, 5)
+    statusText:SetPoint("BOTTOMRIGHT", detailText, "TOPRIGHT", 0, 5)
+    statusText:SetJustifyH("LEFT")
+
+    local separator = panel:CreateTexture(nil, "ARTWORK")
+    separator:SetColorTexture(0.35, 0.35, 0.35, 0.7)
+    separator:SetPoint("BOTTOMLEFT", statusText, "TOPLEFT", -2, 11)
+    separator:SetPoint("BOTTOMRIGHT", statusText, "TOPRIGHT", 2, 11)
+    separator:SetHeight(1)
 
     LoadConfigIntoPanelFields()
     UpdatePanel()
@@ -1507,10 +1515,7 @@ frame:SetScript("OnEvent", function(_, event, ...)
     if event == "ADDON_LOADED" then
         local loadedAddon = ...
         if loadedAddon == ADDON_NAME then
-            local migrated = EnsureDatabases()
-            if migrated then
-                Print("Imported legacy RaidMailerConfig.lua values into the new in-game SavedVariables configuration.")
-            end
+            EnsureDatabases()
         end
 
     elseif event == "MAIL_SHOW" then

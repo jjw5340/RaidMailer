@@ -22,13 +22,12 @@ Copy the entire `RaidMailer` folder to:
 World of Warcraft\_anniversary_\Interface\AddOns\
 ```
 
-The resulting folder should contain at least:
+The resulting folder should contain:
 
 ```text
 RaidMailer\
 ├── RaidMailer.lua
 ├── RaidMailer.toc
-├── RaidMailerConfig.lua   # temporary legacy-migration source
 └── README.md
 ```
 
@@ -38,7 +37,7 @@ Normal configuration is now performed in game. Players should not need to edit a
 
 Open a mailbox and select the normal **Send Mail** tab. The RaidMailer panel appears beside the mailbox and contains:
 
-- **Quantity / mail** — number of the configured item sent to each recipient; default is `1`.
+- **Qty** — number of the configured item sent to each recipient; default is `1`.
 - **Item ID** — numeric WoW item ID to distribute.
 - **Recipients** — one character name per line.
 - **Save** — validates the quantity and item ID, then copies the displayed values into RaidMailer's per-character SavedVariables configuration.
@@ -94,21 +93,6 @@ CharacterThree
 
 Clicking **Save** updates the SavedVariables table immediately in memory. WoW itself writes SavedVariables to the WTF folder during normal SavedVariables flushes such as `/reload`, logout, or client exit; addons cannot force an immediate disk write.
 
-## Legacy `RaidMailerConfig.lua` Migration
-
-The development build still loads `RaidMailerConfig.lua` for one-time migration from v0.6.0 and earlier.
-
-If `RaidMailerDB.config` does not already exist, RaidMailer imports:
-
-- `itemID` into the per-character distribution configuration;
-- `recipients` into the per-character distribution configuration;
-- `interMailDelay`, `panelOffsetX`, and `panelOffsetY` into the account-wide settings database;
-- quantity defaults to `1`.
-
-After the values have been migrated, normal configuration is performed through the in-game UI and subsequent changes to `RaidMailerConfig.lua` are ignored.
-
-For an existing customized installation, preserve the old `RaidMailerConfig.lua` for the first login or `/reload` with this development build so RaidMailer can import it.
-
 ## Use
 
 1. Open a mailbox and select the normal **Send Mail** tab.
@@ -161,4 +145,3 @@ RaidMailer deliberately waits for WoW's bag and mail APIs to agree with the visi
 
 The item entry currently accepts only a numeric item ID. Future versions may support item names and shift-clicked item links.
 
-`RaidMailerConfig.lua` is retained temporarily only so pre-UI installations can migrate their existing values. It can be removed from the addon once legacy migration is no longer needed.
