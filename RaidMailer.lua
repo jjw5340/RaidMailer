@@ -1426,6 +1426,18 @@ local function CreatePanel()
     -- the ScrollFrame child and WoW is allowed to manage its multiline height.
     recipientsScrollFrame:SetScrollChild(recipientsEdit)
 
+    -- Let blank space below the recipient text behave like the editor background.
+    -- Existing text clicks still go directly to the EditBox for precise placement.
+    recipientsScrollFrame:EnableMouse(true)
+    recipientsScrollFrame:SetScript("OnMouseDown", function(_, button)
+        if button ~= "LeftButton" or not recipientsEdit:IsEnabled() then
+            return
+        end
+
+        recipientsEdit:SetFocus()
+        recipientsEdit:SetCursorPosition(recipientsEdit:GetNumLetters())
+    end)
+
     if ScrollingEdit_OnCursorChanged then
         ScrollingEdit_OnCursorChanged(recipientsEdit, 0, 0, 0, 0)
     end
