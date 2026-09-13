@@ -2,7 +2,7 @@
 ## Title: RaidMailer
 ## Notes: Distributes a configured quantity of an item to a saved recipient list with resumable batch progress.
 ## Author: Ary
-## Version: 0.6.0
+## Version: 0.7.0
 ## SavedVariables: RaidMailerSettingsDB
 ## SavedVariablesPerCharacter: RaidMailerDB
 

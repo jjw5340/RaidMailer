@@ -2,11 +2,9 @@
 
 RaidMailer is a World of Warcraft addon for distributing a configured quantity of an item to a saved list of characters through in-game mail.
 
-**Current tagged release:** 0.6.0  
-**Game:** WoW Burning Crusade Classic Anniversary 2.5.6  
+**Current tagged release:** 0.7.0
+**Game:** WoW Burning Crusade Classic Anniversary 2.5.6
 **Interface:** 20506
-
-> The current development source contains unreleased in-game configuration UI and quantity-per-mail changes. The `.toc` version remains `0.6.0` until a later commit is selected and tagged as the next release.
 
 ## Purpose
 
@@ -119,7 +117,6 @@ If an exact stack of the configured quantity already exists, RaidMailer prefers 
 - **Resume** continues the saved snapshot.
 - **Restart** discards the old progress only after current configuration validates and begins again from the saved distribution configuration. Restarting can resend items to recipients already completed by the previous job, so RaidMailer asks for confirmation.
 - `/rm reset` clears saved job progress without sending anything.
-- Saved jobs created by v0.6.0 are automatically interpreted as quantity `1`.
 
 ## Timing and Synchronization
 
