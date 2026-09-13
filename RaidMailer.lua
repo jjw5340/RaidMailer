@@ -3,10 +3,10 @@ local ADDON_NAME = ...
 local BODY = ""
 local DEFAULT_NEXT_MAIL_DELAY = 1.00
 local DEFAULT_PANEL_OFFSET_X = 8
-local DEFAULT_PANEL_OFFSET_Y = 1
+local DEFAULT_PANEL_OFFSET_Y = 0
 local DEFAULT_QUANTITY = 1
 local PANEL_WIDTH = 350
-local PANEL_HEIGHT_CORRECTION = 2
+local PANEL_HEIGHT_CORRECTION = 3
 local PANEL_HEIGHT_FALLBACK = 424
 local RECIPIENTS_VISIBLE_HEIGHT = 159
 local RECIPIENTS_EDIT_MIN_HEIGHT = 145
@@ -514,10 +514,11 @@ end
 
 local function UpdateRecipientEditHeight()
     if not recipientsEdit or not recipientsScrollFrame then return end
-    local text = NormalizeRecipientText(recipientsEdit:GetText())
-    local _, newlineCount = text:gsub("\n", "\n")
-    local lineCount = math.max(1, newlineCount + 1)
-    recipientsEdit:SetHeight(math.max(RECIPIENTS_EDIT_MIN_HEIGHT, lineCount * 14 + 12))
+
+    -- Multiline EditBoxes calculate their own text height. Forcing a new height
+    -- after every keystroke can desynchronize the widget's native cursor/mouse
+    -- geometry from the ScrollFrame. Let WoW size the multiline text naturally
+    -- and only ask the ScrollFrame to recalculate its scrollable rectangle.
     if recipientsScrollFrame.UpdateScrollChildRect then
         recipientsScrollFrame:UpdateScrollChildRect()
     end
@@ -1409,22 +1410,45 @@ local function CreatePanel()
     recipientsEdit:SetWidth(280)
     recipientsEdit:SetHeight(RECIPIENTS_EDIT_MIN_HEIGHT)
     recipientsEdit:SetJustifyH("LEFT")
-    recipientsEdit:SetJustifyV("TOP")
     recipientsEdit:SetMaxLetters(8192)
+    recipientsEdit:SetHistoryLines(0)
+    recipientsEdit:SetAltArrowKeyMode(false)
+    recipientsEdit:EnableMouse(true)
     recipientsEdit:SetBlinkSpeed(0.5)
-    recipientsEdit:SetTextInsets(1, 1, 1, 1)
-    recipientsEdit:SetScript("OnEditFocusGained", function()
-        recipientsBorder:SetBackdropBorderColor(0.95, 0.82, 0.25, 1.0)
-    end)
-    recipientsEdit:SetScript("OnEditFocusLost", function()
-        recipientsBorder:SetBackdropBorderColor(1, 1, 1, 1)
-    end)
+    recipientsEdit:SetTextColor(1, 1, 1, 1)
+
+    -- Keep the actual EditBox above the ScrollFrame in the mouse hit-test order.
+    -- The EditBox must receive the click itself for WoW to place the insertion
+    -- cursor at the clicked character; merely focusing it is not sufficient.
+    recipientsEdit:SetFrameLevel(recipientsScrollFrame:GetFrameLevel() + 1)
+
+    -- Match Blizzard's native multiline scrolling-edit pattern. The EditBox is
+    -- the ScrollFrame child and WoW is allowed to manage its multiline height.
+    recipientsScrollFrame:SetScrollChild(recipientsEdit)
+
+    if ScrollingEdit_OnCursorChanged then
+        ScrollingEdit_OnCursorChanged(recipientsEdit, 0, 0, 0, 0)
+    end
+
     recipientsEdit:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
-    recipientsEdit:SetScript("OnTextChanged", function()
-        UpdateRecipientEditHeight()
+    recipientsEdit:SetScript("OnCursorChanged", function(self, x, y, w, h)
+        if ScrollingEdit_OnCursorChanged then
+            ScrollingEdit_OnCursorChanged(self, x, y, w, h)
+        end
+    end)
+    recipientsEdit:SetScript("OnUpdate", function(self, elapsed)
+        if ScrollingEdit_OnUpdate then
+            ScrollingEdit_OnUpdate(self, elapsed, recipientsScrollFrame)
+        end
+    end)
+    recipientsEdit:SetScript("OnTextChanged", function(self)
+        if ScrollingEdit_OnTextChanged then
+            ScrollingEdit_OnTextChanged(self, recipientsScrollFrame)
+        elseif recipientsScrollFrame.UpdateScrollChildRect then
+            recipientsScrollFrame:UpdateScrollChildRect()
+        end
         if UpdatePanel then UpdatePanel() end
     end)
-    recipientsScrollFrame:SetScrollChild(recipientsEdit)
 
     configRevertButton = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
     configRevertButton:SetSize(104, 23)
