@@ -1,4 +1,14 @@
--- RaidMailer configuration
+-- LEGACY MIGRATION SOURCE (v0.6.0 and earlier)
+--
+-- RaidMailer is now configured in game. This file remains temporarily so an
+-- existing customized installation can be imported into SavedVariables on the
+-- first load of the new development build. After RaidMailerDB.config exists,
+-- changes to this file are ignored.
+--
+-- IMPORTANT FOR EXISTING USERS: preserve your customized copy of this file for
+-- the first /reload after updating so RaidMailer can import it.
+--
+-- Legacy fields follow.
 --
 -- ITEM
 -- Set itemID to the numeric WoW item ID for the item you want to distribute.

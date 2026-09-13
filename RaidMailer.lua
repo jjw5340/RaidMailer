@@ -4,6 +4,7 @@ local BODY = ""
 local DEFAULT_NEXT_MAIL_DELAY = 1.00
 local DEFAULT_PANEL_OFFSET_X = 8
 local DEFAULT_PANEL_OFFSET_Y = -32
+local DEFAULT_QUANTITY = 1
 local ATTACHMENT_SETTLE_DELAY = 0.35
 local MAIL_CLEAR_TIMEOUT = 12.0
 local STATE_POLL_INTERVAL = 0.10
@@ -13,50 +14,27 @@ local ITEM_LOCK_TIMEOUT = 12.0
 local MAIL_RETRY_DELAY = 2.0
 local MAX_MAIL_RETRIES = 3
 
-
-local function GetNextMailDelay()
-    local configured = RaidMailerConfig and tonumber(RaidMailerConfig.interMailDelay)
-    if configured then
-        -- Very short gaps are where the Anniversary mail UI has proven flaky.
-        -- Keep a conservative floor even if the config is accidentally lower.
-        return math.max(0.75, math.min(configured, 10.0))
-    end
-    return DEFAULT_NEXT_MAIL_DELAY
-end
-
-local function GetPanelOffsetX()
-    local configured = RaidMailerConfig and tonumber(RaidMailerConfig.panelOffsetX)
-    return configured or DEFAULT_PANEL_OFFSET_X
-end
-
-local function GetPanelOffsetY()
-    local configured = RaidMailerConfig and tonumber(RaidMailerConfig.panelOffsetY)
-    return configured or DEFAULT_PANEL_OFFSET_Y
-end
-
-local function GetConfiguredItemID()
-    return RaidMailerConfig and tonumber(RaidMailerConfig.itemID) or nil
-end
-
-local function GetItemNameByID(itemID)
-    if not itemID then
-        return "configured item"
-    end
-
-    local name = GetItemInfo(itemID)
-    return name or ("item " .. itemID)
-end
-
-local function GetConfiguredItemName()
-    return GetItemNameByID(GetConfiguredItemID())
-end
-
 local frame = CreateFrame("Frame")
 local panel
+local settingsFrame
 local sendButton
 local cancelButton
+local settingsButton
 local statusText
 local detailText
+local quantityEdit
+local itemIDEdit
+local itemNameText
+local recipientsEdit
+local recipientsScrollFrame
+local configSaveButton
+local configRevertButton
+local settingsXEdit
+local settingsYEdit
+local settingsDelayEdit
+local settingsSaveButton
+local settingsRevertButton
+local UpdatePanel
 
 local state = {
     running = false,
@@ -73,6 +51,7 @@ local state = {
     mailRetryCount = 0,
     recipients = {},
     itemID = nil,
+    quantity = nil,
     index = 0,
     sent = 0,
     currentRecipient = nil,
@@ -84,18 +63,12 @@ local function Print(message)
     DEFAULT_CHAT_FRAME:AddMessage("|cff9482c9RaidMailer:|r " .. tostring(message))
 end
 
-local function GetRunItemID()
-    return state.itemID or GetConfiguredItemID()
+local function Trim(text)
+    return (tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
-local function GetRunItemName()
-    return GetItemNameByID(GetRunItemID())
-end
-
-local function EnsureDB()
-    if type(RaidMailerDB) ~= "table" then
-        RaidMailerDB = {}
-    end
+local function NormalizeRecipientText(text)
+    return tostring(text or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
 end
 
 local function CopyArray(source)
@@ -106,8 +79,127 @@ local function CopyArray(source)
     return copy
 end
 
+local function EnsureDatabases()
+    if type(RaidMailerDB) ~= "table" then
+        RaidMailerDB = {}
+    end
+    if type(RaidMailerSettingsDB) ~= "table" then
+        RaidMailerSettingsDB = {}
+    end
+
+    local legacy = type(RaidMailerConfig) == "table" and RaidMailerConfig or nil
+    local migratedLegacyConfig = false
+
+    if type(RaidMailerDB.config) ~= "table" then
+        RaidMailerDB.config = {
+            quantity = DEFAULT_QUANTITY,
+            itemID = legacy and tonumber(legacy.itemID) or nil,
+            recipients = legacy and NormalizeRecipientText(legacy.recipients) or "",
+        }
+        migratedLegacyConfig = legacy ~= nil
+    end
+
+    local config = RaidMailerDB.config
+    local quantity = tonumber(config.quantity)
+    if not quantity or quantity < 1 or quantity ~= math.floor(quantity) then
+        config.quantity = DEFAULT_QUANTITY
+    else
+        config.quantity = math.floor(quantity)
+    end
+
+    local itemID = tonumber(config.itemID)
+    if itemID and itemID > 0 and itemID == math.floor(itemID) then
+        config.itemID = math.floor(itemID)
+    else
+        config.itemID = nil
+    end
+    config.recipients = NormalizeRecipientText(config.recipients)
+
+    if RaidMailerSettingsDB.interMailDelay == nil then
+        RaidMailerSettingsDB.interMailDelay = legacy and tonumber(legacy.interMailDelay) or DEFAULT_NEXT_MAIL_DELAY
+    end
+    if RaidMailerSettingsDB.panelOffsetX == nil then
+        RaidMailerSettingsDB.panelOffsetX = legacy and tonumber(legacy.panelOffsetX) or DEFAULT_PANEL_OFFSET_X
+    end
+    if RaidMailerSettingsDB.panelOffsetY == nil then
+        RaidMailerSettingsDB.panelOffsetY = legacy and tonumber(legacy.panelOffsetY) or DEFAULT_PANEL_OFFSET_Y
+    end
+
+    local delay = tonumber(RaidMailerSettingsDB.interMailDelay) or DEFAULT_NEXT_MAIL_DELAY
+    RaidMailerSettingsDB.interMailDelay = math.max(0.75, math.min(delay, 10.0))
+    RaidMailerSettingsDB.panelOffsetX = tonumber(RaidMailerSettingsDB.panelOffsetX) or DEFAULT_PANEL_OFFSET_X
+    RaidMailerSettingsDB.panelOffsetY = tonumber(RaidMailerSettingsDB.panelOffsetY) or DEFAULT_PANEL_OFFSET_Y
+
+    RaidMailerDB.schemaVersion = 2
+    RaidMailerSettingsDB.schemaVersion = 1
+
+    if migratedLegacyConfig then
+        RaidMailerDB.legacyConfigMigrated = true
+    end
+
+    return migratedLegacyConfig
+end
+
+local function GetSavedConfig()
+    EnsureDatabases()
+    return RaidMailerDB.config
+end
+
+local function GetNextMailDelay()
+    EnsureDatabases()
+    return math.max(0.75, math.min(tonumber(RaidMailerSettingsDB.interMailDelay) or DEFAULT_NEXT_MAIL_DELAY, 10.0))
+end
+
+local function GetPanelOffsetX()
+    EnsureDatabases()
+    return tonumber(RaidMailerSettingsDB.panelOffsetX) or DEFAULT_PANEL_OFFSET_X
+end
+
+local function GetPanelOffsetY()
+    EnsureDatabases()
+    return tonumber(RaidMailerSettingsDB.panelOffsetY) or DEFAULT_PANEL_OFFSET_Y
+end
+
+local function GetConfiguredItemID()
+    return tonumber(GetSavedConfig().itemID)
+end
+
+local function GetConfiguredQuantity()
+    local quantity = tonumber(GetSavedConfig().quantity) or DEFAULT_QUANTITY
+    return math.max(1, math.floor(quantity))
+end
+
+local function GetConfiguredRecipientsText()
+    return NormalizeRecipientText(GetSavedConfig().recipients)
+end
+
+local function GetItemNameByID(itemID)
+    if not itemID then
+        return "configured item"
+    end
+
+    local name = GetItemInfo(itemID)
+    return name or ("item " .. itemID)
+end
+
+local function GetConfiguredItemName()
+    return GetItemNameByID(GetConfiguredItemID())
+end
+
+local function GetRunItemID()
+    return state.itemID or GetConfiguredItemID()
+end
+
+local function GetRunQuantity()
+    return state.quantity or GetConfiguredQuantity()
+end
+
+local function GetRunItemName()
+    return GetItemNameByID(GetRunItemID())
+end
+
 local function GetSavedJob()
-    EnsureDB()
+    EnsureDatabases()
     local job = RaidMailerDB.job
     if type(job) ~= "table" or type(job.recipients) ~= "table" or type(job.itemID) ~= "number" then
         RaidMailerDB.job = nil
@@ -121,16 +213,23 @@ local function GetSavedJob()
         return nil
     end
 
+    local quantity = tonumber(job.quantity) or 1 -- v0.6.0 jobs did not store quantity.
+    if quantity < 1 or quantity ~= math.floor(quantity) then
+        quantity = 1
+    end
+
+    job.quantity = math.floor(quantity)
     job.nextIndex = nextIndex
     job.sent = math.max(0, math.min(total, tonumber(job.sent) or (nextIndex - 1)))
     return job
 end
 
-local function CreateSavedJob(itemID, recipients)
-    EnsureDB()
+local function CreateSavedJob(itemID, quantity, recipients)
+    EnsureDatabases()
     RaidMailerDB.job = {
-        version = 1,
+        version = 2,
         itemID = itemID,
+        quantity = quantity,
         recipients = CopyArray(recipients),
         nextIndex = 1,
         sent = 0,
@@ -142,7 +241,7 @@ local function CreateSavedJob(itemID, recipients)
 end
 
 local function SaveProgress(pausedReason)
-    EnsureDB()
+    EnsureDatabases()
     local job = RaidMailerDB.job
     if type(job) ~= "table" then
         return
@@ -155,12 +254,8 @@ local function SaveProgress(pausedReason)
 end
 
 local function ClearSavedJob()
-    EnsureDB()
+    EnsureDatabases()
     RaidMailerDB.job = nil
-end
-
-local function Trim(text)
-    return (text:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
 local function NormalizeRealm(realm)
@@ -185,9 +280,8 @@ local function IsPlayerCharacter(recipient)
     return NormalizeRealm(realm) == NormalizeRealm(playerRealm)
 end
 
-local function ParseRecipients()
-    local text = (RaidMailerConfig and RaidMailerConfig.recipients) or ""
-    text = text:gsub("\r\n", "\n"):gsub("\r", "\n")
+local function ParseRecipients(text)
+    text = NormalizeRecipientText(text ~= nil and text or GetConfiguredRecipientsText())
     local recipients = {}
     local seen = {}
     local duplicates = {}
@@ -260,16 +354,16 @@ local function CountConfiguredItemsInBags()
     return CountItemInBags(GetConfiguredItemID())
 end
 
-local function FindConfiguredSingleton()
+local function FindConfiguredExactStack()
     local itemID = GetRunItemID()
+    local quantity = GetRunQuantity()
     if not itemID then return nil, nil, false end
 
     local foundLocked = false
-
     for bag = 0, 4 do
         for slot = 1, GetNumSlots(bag) do
             local info = GetContainerInfo(bag, slot)
-            if info and info.itemID == itemID and (info.stackCount or 0) == 1 then
+            if info and info.itemID == itemID and (info.stackCount or 0) == quantity then
                 if info.isLocked then
                     foundLocked = true
                 else
@@ -282,16 +376,16 @@ local function FindConfiguredSingleton()
     return nil, nil, foundLocked
 end
 
-local function FindConfiguredLargeStack()
+local function FindConfiguredSourceStack()
     local itemID = GetRunItemID()
+    local quantity = GetRunQuantity()
     if not itemID then return nil, nil, nil, false end
 
     local foundLocked = false
-
     for bag = 0, 4 do
         for slot = 1, GetNumSlots(bag) do
             local info = GetContainerInfo(bag, slot)
-            if info and info.itemID == itemID and (info.stackCount or 0) > 1 then
+            if info and info.itemID == itemID and (info.stackCount or 0) > quantity then
                 if info.isLocked then
                     foundLocked = true
                 else
@@ -381,15 +475,250 @@ local function ApplyPanelPosition()
     panel:SetPoint("TOPLEFT", MailFrame, "TOPRIGHT", GetPanelOffsetX(), GetPanelOffsetY())
 end
 
-local function UpdatePanel()
+local function SetEditBoxEnabled(editBox, enabled)
+    if not editBox then return end
+    if enabled then
+        editBox:Enable()
+        editBox:SetTextColor(1, 1, 1)
+    else
+        editBox:Disable()
+        editBox:SetTextColor(0.55, 0.55, 0.55)
+    end
+end
+
+local function SetConfigEditorEnabled(enabled)
+    SetEditBoxEnabled(quantityEdit, enabled)
+    SetEditBoxEnabled(itemIDEdit, enabled)
+    SetEditBoxEnabled(recipientsEdit, enabled)
+end
+
+local function GetPanelFormValues()
+    local quantity = quantityEdit and tonumber(Trim(quantityEdit:GetText())) or nil
+    local itemID = itemIDEdit and tonumber(Trim(itemIDEdit:GetText())) or nil
+    local recipients = recipientsEdit and NormalizeRecipientText(recipientsEdit:GetText()) or ""
+    return quantity, itemID, recipients
+end
+
+local function IsConfigFormDirty()
+    if not quantityEdit or not itemIDEdit or not recipientsEdit then
+        return false
+    end
+
+    local config = GetSavedConfig()
+    local quantity, itemID, recipients = GetPanelFormValues()
+    return quantity ~= tonumber(config.quantity)
+        or itemID ~= tonumber(config.itemID)
+        or recipients ~= NormalizeRecipientText(config.recipients)
+end
+
+local function UpdateRecipientEditHeight()
+    if not recipientsEdit or not recipientsScrollFrame then return end
+    local text = NormalizeRecipientText(recipientsEdit:GetText())
+    local _, newlineCount = text:gsub("\n", "\n")
+    local lineCount = math.max(1, newlineCount + 1)
+    recipientsEdit:SetHeight(math.max(236, lineCount * 14 + 12))
+    if recipientsScrollFrame.UpdateScrollChildRect then
+        recipientsScrollFrame:UpdateScrollChildRect()
+    end
+end
+
+local function UpdateItemNamePreview()
+    if not itemNameText then return end
+    local itemID = itemIDEdit and tonumber(Trim(itemIDEdit:GetText())) or nil
+    if itemID and itemID > 0 and itemID == math.floor(itemID) then
+        itemNameText:SetText(GetItemNameByID(itemID))
+    else
+        itemNameText:SetText("Enter a numeric item ID")
+    end
+end
+
+local function LoadConfigIntoPanelFields()
+    if not quantityEdit or not itemIDEdit or not recipientsEdit then return end
+    local config = GetSavedConfig()
+    quantityEdit:SetText(tostring(config.quantity or DEFAULT_QUANTITY))
+    itemIDEdit:SetText(config.itemID and tostring(config.itemID) or "")
+    recipientsEdit:SetText(NormalizeRecipientText(config.recipients))
+    UpdateRecipientEditHeight()
+    UpdateItemNamePreview()
+    if UpdatePanel then UpdatePanel() end
+end
+
+local function SaveDistributionConfigFromUI()
+    if state.running then
+        Print("Cannot save distribution configuration while a batch is running.")
+        return false
+    end
+
+    local quantity, itemID, recipients = GetPanelFormValues()
+    if not quantity or quantity < 1 or quantity ~= math.floor(quantity) then
+        Print("Quantity per mail must be a positive whole number.")
+        return false
+    end
+    if not itemID or itemID <= 0 or itemID ~= math.floor(itemID) then
+        Print("Item ID must be a positive whole-number WoW item ID.")
+        return false
+    end
+
+    local config = GetSavedConfig()
+    config.quantity = math.floor(quantity)
+    config.itemID = math.floor(itemID)
+    config.recipients = NormalizeRecipientText(recipients)
+
+    LoadConfigIntoPanelFields()
+    if GetSavedJob() then
+        Print("Distribution configuration saved. The paused batch keeps its original item, quantity, and recipient snapshot until it is resumed, reset, or restarted.")
+    else
+        Print("Distribution configuration saved.")
+    end
+    return true
+end
+
+local function LoadSettingsIntoWindow()
+    if not settingsXEdit or not settingsYEdit or not settingsDelayEdit then return end
+    EnsureDatabases()
+    settingsXEdit:SetText(tostring(RaidMailerSettingsDB.panelOffsetX or DEFAULT_PANEL_OFFSET_X))
+    settingsYEdit:SetText(tostring(RaidMailerSettingsDB.panelOffsetY or DEFAULT_PANEL_OFFSET_Y))
+    settingsDelayEdit:SetText(tostring(RaidMailerSettingsDB.interMailDelay or DEFAULT_NEXT_MAIL_DELAY))
+end
+
+local function SaveSettingsFromUI()
+    local x = settingsXEdit and tonumber(Trim(settingsXEdit:GetText())) or nil
+    local y = settingsYEdit and tonumber(Trim(settingsYEdit:GetText())) or nil
+    local delay = settingsDelayEdit and tonumber(Trim(settingsDelayEdit:GetText())) or nil
+
+    if not x or not y then
+        Print("Panel X and Y offsets must be numbers.")
+        return false
+    end
+    if not delay or delay < 0.75 or delay > 10.0 then
+        Print("Inter-mail delay must be between 0.75 and 10 seconds.")
+        return false
+    end
+
+    EnsureDatabases()
+    RaidMailerSettingsDB.panelOffsetX = x
+    RaidMailerSettingsDB.panelOffsetY = y
+    RaidMailerSettingsDB.interMailDelay = delay
+    ApplyPanelPosition()
+    LoadSettingsIntoWindow()
+    Print("RaidMailer settings saved.")
+    return true
+end
+
+local function CreateSettingsWindow()
+    if settingsFrame then return end
+
+    settingsFrame = CreateFrame("Frame", "RaidMailerSettingsFrame", UIParent, "BackdropTemplate")
+    settingsFrame:SetSize(330, 220)
+    settingsFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    settingsFrame:SetFrameStrata("DIALOG")
+    settingsFrame:SetClampedToScreen(true)
+    settingsFrame:SetBackdrop({
+        bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        tile = true,
+        tileSize = 16,
+        edgeSize = 16,
+        insets = { left = 4, right = 4, top = 4, bottom = 4 },
+    })
+    settingsFrame:Hide()
+
+    local title = settingsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    title:SetPoint("TOPLEFT", 16, -14)
+    title:SetText("RaidMailer Settings")
+
+    local closeButton = CreateFrame("Button", nil, settingsFrame, "UIPanelCloseButton")
+    closeButton:SetPoint("TOPRIGHT", -5, -5)
+
+    local xLabel = settingsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    xLabel:SetPoint("TOPLEFT", 20, -52)
+    xLabel:SetText("Panel X offset")
+
+    settingsXEdit = CreateFrame("EditBox", nil, settingsFrame, "InputBoxTemplate")
+    settingsXEdit:SetSize(90, 22)
+    settingsXEdit:SetPoint("LEFT", xLabel, "RIGHT", 22, 0)
+    settingsXEdit:SetAutoFocus(false)
+    settingsXEdit:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
+    settingsXEdit:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+
+    local yLabel = settingsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    yLabel:SetPoint("TOPLEFT", xLabel, "BOTTOMLEFT", 0, -28)
+    yLabel:SetText("Panel Y offset")
+
+    settingsYEdit = CreateFrame("EditBox", nil, settingsFrame, "InputBoxTemplate")
+    settingsYEdit:SetSize(90, 22)
+    settingsYEdit:SetPoint("LEFT", yLabel, "RIGHT", 22, 0)
+    settingsYEdit:SetAutoFocus(false)
+    settingsYEdit:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
+    settingsYEdit:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+
+    local delayLabel = settingsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    delayLabel:SetPoint("TOPLEFT", yLabel, "BOTTOMLEFT", 0, -28)
+    delayLabel:SetText("Inter-mail delay")
+
+    settingsDelayEdit = CreateFrame("EditBox", nil, settingsFrame, "InputBoxTemplate")
+    settingsDelayEdit:SetSize(90, 22)
+    settingsDelayEdit:SetPoint("LEFT", delayLabel, "RIGHT", 20, 0)
+    settingsDelayEdit:SetAutoFocus(false)
+    settingsDelayEdit:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
+    settingsDelayEdit:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+
+    local delaySuffix = settingsFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    delaySuffix:SetPoint("LEFT", settingsDelayEdit, "RIGHT", 6, 0)
+    delaySuffix:SetText("seconds")
+
+    local hint = settingsFrame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    hint:SetPoint("TOPLEFT", delayLabel, "BOTTOMLEFT", 0, -25)
+    hint:SetPoint("RIGHT", -20, 0)
+    hint:SetJustifyH("LEFT")
+    hint:SetText("Positive X moves the mailbox panel right; positive Y moves it up. Settings are shared across characters.")
+
+    settingsSaveButton = CreateFrame("Button", nil, settingsFrame, "UIPanelButtonTemplate")
+    settingsSaveButton:SetSize(90, 24)
+    settingsSaveButton:SetPoint("BOTTOMRIGHT", -18, 16)
+    settingsSaveButton:SetText("Save")
+    settingsSaveButton:SetScript("OnClick", SaveSettingsFromUI)
+
+    settingsRevertButton = CreateFrame("Button", nil, settingsFrame, "UIPanelButtonTemplate")
+    settingsRevertButton:SetSize(90, 24)
+    settingsRevertButton:SetPoint("RIGHT", settingsSaveButton, "LEFT", -8, 0)
+    settingsRevertButton:SetText("Revert")
+    settingsRevertButton:SetScript("OnClick", function()
+        LoadSettingsIntoWindow()
+    end)
+
+    if UISpecialFrames then
+        table.insert(UISpecialFrames, "RaidMailerSettingsFrame")
+    end
+end
+
+local function ShowSettingsWindow()
+    CreateSettingsWindow()
+    LoadSettingsIntoWindow()
+    settingsFrame:Show()
+    settingsFrame:Raise()
+end
+
+UpdatePanel = function()
     if not panel then return end
     ApplyPanelPosition()
+    UpdateItemNamePreview()
 
     local itemID = GetConfiguredItemID()
-    local itemName = GetRunItemName()
+    local quantity = GetConfiguredQuantity()
+    local itemName = GetConfiguredItemName()
     local recipients, duplicates, skippedSelf = ParseRecipients()
     local items = CountConfiguredItemsInBags()
     local savedJob = GetSavedJob()
+    local dirty = IsConfigFormDirty()
+
+    SetConfigEditorEnabled(not state.running)
+    if configSaveButton then
+        if not state.running and dirty then configSaveButton:Enable() else configSaveButton:Disable() end
+    end
+    if configRevertButton then
+        if not state.running and dirty then configRevertButton:Enable() else configRevertButton:Disable() end
+    end
 
     if state.running then
         sendButton:SetText("Sending...")
@@ -406,7 +735,7 @@ local function UpdatePanel()
         else
             statusText:SetText(string.format("Sent %d/%d", state.sent, total))
         end
-        detailText:SetText(string.format("%s remaining: %d", GetRunItemName(), CountItemInBags(GetRunItemID())))
+        detailText:SetText(string.format("%d %s per mail; %d remaining in bags.", GetRunQuantity(), GetRunItemName(), CountItemInBags(GetRunItemID())))
         return
     end
 
@@ -414,23 +743,27 @@ local function UpdatePanel()
         local total = #savedJob.recipients
         local sent = savedJob.nextIndex - 1
         local remaining = total - sent
+        local requiredItems = remaining * savedJob.quantity
         local savedItemName = GetItemNameByID(savedJob.itemID)
         local nextRecipient = savedJob.recipients[savedJob.nextIndex] or "?"
+        local savedItems = CountItemInBags(savedJob.itemID)
 
         sendButton:SetText(string.format("Resume (%d left)", remaining))
         cancelButton:SetText("Restart")
-        cancelButton:Enable()
+        if dirty then cancelButton:Disable() else cancelButton:Enable() end
 
         if savedJob.pausedReason == "mailcap" then
             statusText:SetText(string.format("Paused: mail cap (%d/%d sent)", sent, total))
         else
             statusText:SetText(string.format("Paused: %d/%d sent", sent, total))
         end
-        detailText:SetText(string.format("Next: %s. %d %s in bags.", nextRecipient, CountItemInBags(savedJob.itemID), savedItemName))
 
-        if CountItemInBags(savedJob.itemID) < remaining then
+        local dirtySuffix = dirty and " Unsaved form changes do not affect Resume; Save or Revert before Restart." or ""
+        detailText:SetText(string.format("Next: %s. %d each; %d %s in bags.%s", nextRecipient, savedJob.quantity, savedItems, savedItemName, dirtySuffix))
+
+        if savedItems < requiredItems then
             sendButton:Disable()
-            detailText:SetText(string.format("Next: %s. Need %d more %s to finish.", nextRecipient, remaining, savedItemName))
+            detailText:SetText(string.format("Next: %s. Need %d %s to finish; %d are in bags.%s", nextRecipient, requiredItems, savedItemName, savedItems, dirtySuffix))
         else
             sendButton:Enable()
         end
@@ -441,9 +774,17 @@ local function UpdatePanel()
     cancelButton:Disable()
     sendButton:SetText(string.format("Send Items (%d)", #recipients))
 
-    if not itemID or itemID <= 0 or itemID ~= math.floor(itemID) then
+    if dirty then
+        statusText:SetText("Unsaved distribution changes")
+        detailText:SetText("Save or Revert the quantity, item ID, and recipient list before starting a new batch.")
+        sendButton:Disable()
+    elseif not itemID or itemID <= 0 or itemID ~= math.floor(itemID) then
         statusText:SetText("Invalid item configuration")
-        detailText:SetText("Set itemID in RaidMailerConfig.lua to a valid numeric WoW item ID.")
+        detailText:SetText("Enter and save a valid numeric WoW item ID.")
+        sendButton:Disable()
+    elseif not quantity or quantity < 1 or quantity ~= math.floor(quantity) then
+        statusText:SetText("Invalid quantity")
+        detailText:SetText("Quantity per mail must be a positive whole number.")
         sendButton:Disable()
     elseif #duplicates > 0 then
         statusText:SetText("Fix duplicate recipient names")
@@ -451,18 +792,18 @@ local function UpdatePanel()
         sendButton:Disable()
     elseif #recipients == 0 then
         statusText:SetText("No recipients configured")
-        detailText:SetText("Edit RaidMailerConfig.lua: one character name per line.")
+        detailText:SetText("Enter one character name per line and click Save.")
         sendButton:Disable()
-    elseif items < #recipients then
-        statusText:SetText(string.format("Need %d; you have %d", #recipients, items))
-        detailText:SetText("Configured item: " .. itemName)
+    elseif items < (#recipients * quantity) then
+        statusText:SetText(string.format("Need %d; you have %d", #recipients * quantity, items))
+        detailText:SetText(string.format("%d %s will be mailed to each recipient.", quantity, itemName))
         sendButton:Disable()
     else
         statusText:SetText(string.format("Ready: %d recipients, %d items", #recipients, items))
         if skippedSelf > 0 then
-            detailText:SetText(string.format("%s. Your character is listed and will be skipped (%d time%s).", itemName, skippedSelf, skippedSelf == 1 and "" or "s"))
+            detailText:SetText(string.format("%d %s per recipient. Your character is listed and will be skipped (%d time%s).", quantity, itemName, skippedSelf, skippedSelf == 1 and "" or "s"))
         else
-            detailText:SetText("One " .. itemName .. " will be mailed to each listed character.")
+            detailText:SetText(string.format("%d %s will be mailed to each listed character.", quantity, itemName))
         end
         sendButton:Enable()
     end
@@ -484,6 +825,7 @@ local function StopRun(message, isError)
     state.mailRetryCount = 0
     state.currentRecipient = nil
     state.itemID = nil
+    state.quantity = nil
     state.cancelRequested = false
 
     ClearCursor()
@@ -509,14 +851,15 @@ local VerifySplitAndAttach
 local RetryCurrentMail
 local VerifyPreviousMailCleared
 
-local function AttachSingletonFromBag(generation, bag, slot, lockStartedAt)
+local function AttachPreparedStackFromBag(generation, bag, slot, lockStartedAt)
     if generation ~= state.generation or not state.running or state.awaitingResult or state.awaitingAttachment or state.awaitingSplit or state.awaitingRetry or state.awaitingMailClear then
         return
     end
 
+    local quantity = GetRunQuantity()
     local info = GetContainerInfo(bag, slot)
-    if not info or info.itemID ~= GetRunItemID() or (info.stackCount or 0) ~= 1 then
-        StopRun("Stopped: the prepared 1-item stack is no longer available.", true)
+    if not info or info.itemID ~= GetRunItemID() or (info.stackCount or 0) ~= quantity then
+        StopRun(string.format("Stopped: the prepared %d-item stack is no longer available.", quantity), true)
         return
     end
 
@@ -524,12 +867,12 @@ local function AttachSingletonFromBag(generation, bag, slot, lockStartedAt)
         lockStartedAt = lockStartedAt or GetTime()
         if GetTime() - lockStartedAt < ITEM_LOCK_TIMEOUT then
             C_Timer.After(STATE_POLL_INTERVAL, function()
-                AttachSingletonFromBag(generation, bag, slot, lockStartedAt)
+                AttachPreparedStackFromBag(generation, bag, slot, lockStartedAt)
             end)
             return
         end
 
-        StopRun("Stopped: the prepared 1-item " .. GetRunItemName() .. " stack remained locked for more than " .. ITEM_LOCK_TIMEOUT .. " seconds.", true)
+        StopRun(string.format("Stopped: the prepared %d-item %s stack remained locked for more than %d seconds.", quantity, GetRunItemName(), ITEM_LOCK_TIMEOUT), true)
         return
     end
 
@@ -537,12 +880,10 @@ local function AttachSingletonFromBag(generation, bag, slot, lockStartedAt)
     PickupContainerSlot(bag, slot)
 
     if not CursorHasItem() then
-        StopRun("Stopped: could not pick up a single " .. GetRunItemName() .. " from your bags.", true)
+        StopRun(string.format("Stopped: could not pick up the prepared %d %s from your bags.", quantity, GetRunItemName()), true)
         return
     end
 
-    -- MAIL_SEND_INFO_UPDATE may fire from inside ClickSendMailItemButton(),
-    -- so mark this state before dropping the cursor item into the mail slot.
     state.awaitingAttachment = true
     state.attachmentStartedAt = GetTime()
     state.currentRecipient = state.recipients[state.index]
@@ -555,22 +896,23 @@ local function AttachSingletonFromBag(generation, bag, slot, lockStartedAt)
     end)
 end
 
-local function PrepareOneItemInBag(generation, sourceBag, sourceSlot)
+local function PrepareConfiguredQuantityInBag(generation, sourceBag, sourceSlot)
+    local quantity = GetRunQuantity()
     local emptyBag, emptySlot = FindEmptyGeneralBagSlot()
     if not emptyBag then
-        StopRun("Stopped: RaidMailer needs one empty slot in the backpack or an ordinary bag to split " .. GetRunItemName() .. ".", true)
+        StopRun(string.format("Stopped: RaidMailer needs one empty slot in the backpack or an ordinary bag to prepare %d %s.", quantity, GetRunItemName()), true)
         return
     end
 
     ClearCursor()
-    SplitContainerStack(sourceBag, sourceSlot, 1)
+    SplitContainerStack(sourceBag, sourceSlot, quantity)
 
     if not CursorHasItem() then
-        StopRun("Stopped: could not split one " .. GetRunItemName() .. " from the source stack.", true)
+        StopRun(string.format("Stopped: could not split %d %s from the source stack.", quantity, GetRunItemName()), true)
         return
     end
 
-    -- Put the split item into a real bag slot first.  The Anniversary client
+    -- Put the split quantity into a real bag slot first. The Anniversary client
     -- can fail when a freshly split cursor stack is attached directly to mail.
     PickupContainerSlot(emptyBag, emptySlot)
 
@@ -587,47 +929,46 @@ local function PrepareOneItemInBag(generation, sourceBag, sourceSlot)
     state.currentRecipient = state.recipients[state.index]
     UpdatePanel()
 
-    -- BAG_UPDATE_DELAYED is the normal continuation path.  Keep a timer
-    -- fallback in case another addon/client quirk swallows that event.
     C_Timer.After(STATE_POLL_INTERVAL, function()
         VerifySplitAndAttach(generation)
     end)
 end
 
-local function BeginAttachOneConfiguredItem(generation, lockStartedAt)
+local function BeginAttachConfiguredQuantity(generation, lockStartedAt)
     if generation ~= state.generation or not state.running or state.awaitingResult or state.awaitingAttachment or state.awaitingSplit or state.awaitingRetry or state.awaitingMailClear then
         return
     end
 
-    -- Prefer an existing 1-item stack.  This both matches the proven manual
-    -- workflow and prevents a large stack earlier in bag order from winning.
-    local singleBag, singleSlot, singleLocked = FindConfiguredSingleton()
-    if singleBag then
-        AttachSingletonFromBag(generation, singleBag, singleSlot)
+    -- Prefer an existing stack of exactly the requested quantity. Otherwise
+    -- split the requested quantity from a larger stack into a real bag slot.
+    local exactBag, exactSlot, exactLocked = FindConfiguredExactStack()
+    if exactBag then
+        AttachPreparedStackFromBag(generation, exactBag, exactSlot)
         return
     end
 
-    local bag, slot, stackCount, largeLocked = FindConfiguredLargeStack()
+    local bag, slot, stackCount, sourceLocked = FindConfiguredSourceStack()
     if bag then
-        PrepareOneItemInBag(generation, bag, slot)
+        PrepareConfiguredQuantityInBag(generation, bag, slot)
         return
     end
 
-    if singleLocked or largeLocked then
+    if exactLocked or sourceLocked then
         lockStartedAt = lockStartedAt or GetTime()
         if GetTime() - lockStartedAt < ITEM_LOCK_TIMEOUT then
             C_Timer.After(STATE_POLL_INTERVAL, function()
-                BeginAttachOneConfiguredItem(generation, lockStartedAt)
+                BeginAttachConfiguredQuantity(generation, lockStartedAt)
             end)
             return
         end
     end
 
     local itemName = GetRunItemName()
-    if singleLocked or largeLocked then
+    local quantity = GetRunQuantity()
+    if exactLocked or sourceLocked then
         StopRun("Stopped: the remaining " .. itemName .. " stayed locked for more than " .. ITEM_LOCK_TIMEOUT .. " seconds.", true)
     else
-        StopRun("Stopped: no accessible " .. itemName .. " remains in your bags.", true)
+        StopRun(string.format("Stopped: no accessible stack contains at least %d %s. Consolidate the item into a larger stack and resume.", quantity, itemName), true)
     end
 end
 
@@ -637,18 +978,17 @@ VerifySplitAndAttach = function(generation)
     end
 
     local bag, slot = state.splitBag, state.splitSlot
+    local quantity = GetRunQuantity()
     local info = bag and slot and GetContainerInfo(bag, slot) or nil
 
-    if info and info.itemID == GetRunItemID() and (info.stackCount or 0) == 1 and not info.isLocked then
+    if info and info.itemID == GetRunItemID() and (info.stackCount or 0) == quantity and not info.isLocked then
         state.awaitingSplit = false
         state.splitStartedAt = nil
         state.splitBag = nil
         state.splitSlot = nil
 
-        -- Give the bag system one additional frame after the slot becomes
-        -- readable before picking the new singleton back up.
         C_Timer.After(STATE_POLL_INTERVAL, function()
-            AttachSingletonFromBag(generation, bag, slot)
+            AttachPreparedStackFromBag(generation, bag, slot)
         end)
         return
     end
@@ -662,7 +1002,7 @@ VerifySplitAndAttach = function(generation)
         return
     end
 
-    StopRun("Stopped: WoW did not finish creating the 1-item " .. GetRunItemName() .. " stack within " .. BAG_OPERATION_TIMEOUT .. " seconds.", true)
+    StopRun(string.format("Stopped: WoW did not finish creating the %d-item %s stack within %d seconds.", quantity, GetRunItemName(), BAG_OPERATION_TIMEOUT), true)
 end
 
 local function SendCurrentMail(generation)
@@ -682,11 +1022,9 @@ VerifyAttachmentAndSend = function(generation)
         return
     end
 
+    local quantity = GetRunQuantity()
     local name, itemID, _, count = GetSendMailItem(1)
-    if name and itemID == GetRunItemID() and count == 1 then
-        -- GetSendMailItem() can become readable slightly before the mail UI/server
-        -- is fully settled.  Stop further attachment verification now, then
-        -- give WoW a short quiet period before calling SendMail().
+    if name and itemID == GetRunItemID() and count == quantity then
         state.awaitingAttachment = false
         state.attachmentStartedAt = nil
         C_Timer.After(ATTACHMENT_SETTLE_DELAY, function()
@@ -712,7 +1050,7 @@ VerifyAttachmentAndSend = function(generation)
         diagnostic = " API reports attachment slot 1 as empty."
     end
     ClearCursor()
-    StopRun("Stopped: WoW did not attach exactly one " .. GetRunItemName() .. " within " .. ATTACHMENT_TIMEOUT .. " seconds." .. diagnostic, true)
+    StopRun(string.format("Stopped: WoW did not attach exactly %d %s within %d seconds.%s", quantity, GetRunItemName(), ATTACHMENT_TIMEOUT, diagnostic), true)
 end
 
 RetryCurrentMail = function(generation)
@@ -722,19 +1060,16 @@ RetryCurrentMail = function(generation)
 
     state.awaitingRetry = false
 
-    -- A failed SendMail attempt normally leaves the attachment in the compose
-    -- window.  Reuse it when it is still exactly the configured singleton.
+    local quantity = GetRunQuantity()
     local name, itemID, _, count = GetSendMailItem(1)
-    if name and itemID == GetRunItemID() and count == 1 then
+    if name and itemID == GetRunItemID() and count == quantity then
         SendCurrentMail(generation)
         return
     end
 
-    -- If WoW returned the attachment to the bags instead, rebuild the same
-    -- recipient's message.  Never advance the recipient index on MAIL_FAILED.
     ClearSendMail()
     state.currentRecipient = state.recipients[state.index]
-    BeginAttachOneConfiguredItem(generation, GetTime())
+    BeginAttachConfiguredQuantity(generation, GetTime())
 end
 
 VerifyPreviousMailCleared = function(generation)
@@ -783,16 +1118,17 @@ SendNext = function()
 
     if state.index > #state.recipients then
         local sent = state.sent
+        local quantity = GetRunQuantity()
         local itemName = GetRunItemName()
         ClearSavedJob()
-        StopRun(string.format("Complete: sent %d item%s (%s).", sent, sent == 1 and "" or "s", itemName), false)
+        StopRun(string.format("Complete: sent %d mail%s; %d %s distributed.", sent, sent == 1 and "" or "s", sent * quantity, itemName), false)
         return
     end
 
     -- Each successful send should clear the compose state, but explicitly
     -- clear it here as well so every outgoing message starts from a known state.
     ClearSendMail()
-    BeginAttachOneConfiguredItem(state.generation, GetTime())
+    BeginAttachConfiguredQuantity(state.generation, GetTime())
 end
 
 local function ValidateMailboxReady()
@@ -821,9 +1157,10 @@ local function LaunchSavedJob(job, label)
     if not ValidateMailboxReady() then return end
 
     local remaining = #job.recipients - job.nextIndex + 1
+    local requiredItems = remaining * job.quantity
     local items = CountItemInBags(job.itemID)
-    if items < remaining then
-        Print(string.format("Cannot resume: need %d %s but only %d are in your bags.", remaining, GetItemNameByID(job.itemID), items))
+    if items < requiredItems then
+        Print(string.format("Cannot resume: need %d %s but only %d are in your bags.", requiredItems, GetItemNameByID(job.itemID), items))
         return
     end
 
@@ -842,13 +1179,14 @@ local function LaunchSavedJob(job, label)
     state.mailRetryCount = 0
     state.recipients = CopyArray(job.recipients)
     state.itemID = job.itemID
+    state.quantity = job.quantity
     state.index = job.nextIndex
     state.sent = job.nextIndex - 1
     state.currentRecipient = nil
     state.cancelRequested = false
 
     SaveProgress(nil)
-    Print(string.format("%s: %d/%d already sent; %d remaining. Next: %s.", label, state.sent, #state.recipients, remaining, state.recipients[state.index]))
+    Print(string.format("%s: %d/%d already sent; %d remaining at %d item%s each. Next: %s.", label, state.sent, #state.recipients, remaining, state.quantity, state.quantity == 1 and "" or "s", state.recipients[state.index]))
     UpdatePanel()
     SendNext()
 end
@@ -856,9 +1194,19 @@ end
 local function StartFreshRun()
     if state.running then return end
 
+    if IsConfigFormDirty() then
+        Print("Cannot start a new batch with unsaved distribution changes. Click Save or Revert first.")
+        return
+    end
+
     local itemID = GetConfiguredItemID()
+    local quantity = GetConfiguredQuantity()
     if not itemID or itemID <= 0 or itemID ~= math.floor(itemID) then
-        Print("Cannot start: set a valid numeric itemID in RaidMailerConfig.lua.")
+        Print("Cannot start: save a valid numeric item ID in the RaidMailer panel.")
+        return
+    end
+    if not quantity or quantity < 1 or quantity ~= math.floor(quantity) then
+        Print("Cannot start: quantity per mail must be a positive whole number.")
         return
     end
 
@@ -869,21 +1217,22 @@ local function StartFreshRun()
     end
 
     if #recipients == 0 then
-        Print("Cannot start: no recipients are configured in RaidMailerConfig.lua.")
+        Print("Cannot start: no recipients are saved in the RaidMailer panel.")
         return
     end
 
     if not ValidateMailboxReady() then return end
 
+    local requiredItems = #recipients * quantity
     local items = CountItemInBags(itemID)
-    if items < #recipients then
-        Print(string.format("Cannot start: need %d %s but only %d are in your bags.", #recipients, GetItemNameByID(itemID), items))
+    if items < requiredItems then
+        Print(string.format("Cannot start: need %d %s but only %d are in your bags.", requiredItems, GetItemNameByID(itemID), items))
         return
     end
 
-    local job = CreateSavedJob(itemID, recipients)
+    local job = CreateSavedJob(itemID, quantity, recipients)
     local suffix = skippedSelf > 0 and " (your character skipped)" or ""
-    Print(string.format("Starting new batch: %d recipient%s%s.", #recipients, #recipients == 1 and "" or "s", suffix))
+    Print(string.format("Starting new batch: %d recipient%s, %d item%s each%s.", #recipients, #recipients == 1 and "" or "s", quantity, quantity == 1 and "" or "s", suffix))
     LaunchSavedJob(job, "Batch started")
 end
 
@@ -976,7 +1325,7 @@ local function CreatePanel()
     if panel or not SendMailFrame then return end
 
     panel = CreateFrame("Frame", "RaidMailerPanel", SendMailFrame, "BackdropTemplate")
-    panel:SetSize(255, 128)
+    panel:SetSize(350, 535)
     ApplyPanelPosition()
     panel:SetBackdrop({
         bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
@@ -988,12 +1337,107 @@ local function CreatePanel()
     })
 
     local title = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-    title:SetPoint("TOP", 0, -12)
+    title:SetPoint("TOPLEFT", 14, -13)
     title:SetText("RaidMailer")
 
+    settingsButton = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+    settingsButton:SetSize(76, 22)
+    settingsButton:SetPoint("TOPRIGHT", -12, -10)
+    settingsButton:SetText("Settings")
+    settingsButton:SetScript("OnClick", ShowSettingsWindow)
+
+    local quantityLabel = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    quantityLabel:SetPoint("TOPLEFT", 16, -47)
+    quantityLabel:SetText("Quantity / mail")
+
+    quantityEdit = CreateFrame("EditBox", nil, panel, "InputBoxTemplate")
+    quantityEdit:SetSize(90, 22)
+    quantityEdit:SetPoint("TOPLEFT", 16, -64)
+    quantityEdit:SetAutoFocus(false)
+    quantityEdit:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
+    quantityEdit:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+    quantityEdit:SetScript("OnTextChanged", function()
+        if UpdatePanel then UpdatePanel() end
+    end)
+
+    local itemLabel = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    itemLabel:SetPoint("TOPLEFT", 130, -47)
+    itemLabel:SetText("Item ID")
+
+    itemIDEdit = CreateFrame("EditBox", nil, panel, "InputBoxTemplate")
+    itemIDEdit:SetSize(110, 22)
+    itemIDEdit:SetPoint("TOPLEFT", 130, -64)
+    itemIDEdit:SetAutoFocus(false)
+    itemIDEdit:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
+    itemIDEdit:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+    itemIDEdit:SetScript("OnTextChanged", function()
+        UpdateItemNamePreview()
+        if UpdatePanel then UpdatePanel() end
+    end)
+
+    itemNameText = panel:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    itemNameText:SetPoint("LEFT", itemIDEdit, "RIGHT", 8, 0)
+    itemNameText:SetPoint("RIGHT", panel, "RIGHT", -14, 0)
+    itemNameText:SetJustifyH("LEFT")
+
+    local recipientsLabel = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    recipientsLabel:SetPoint("TOPLEFT", 16, -99)
+    recipientsLabel:SetText("Recipients (one character per line)")
+
+    local recipientsBorder = CreateFrame("Frame", nil, panel, "BackdropTemplate")
+    recipientsBorder:SetPoint("TOPLEFT", 14, -116)
+    recipientsBorder:SetPoint("TOPRIGHT", -14, -116)
+    recipientsBorder:SetHeight(245)
+    recipientsBorder:SetBackdrop({
+        bgFile = "Interface\\Buttons\\WHITE8X8",
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        tile = false,
+        edgeSize = 12,
+        insets = { left = 3, right = 3, top = 3, bottom = 3 },
+    })
+    recipientsBorder:SetBackdropColor(0.03, 0.03, 0.03, 0.85)
+
+    recipientsScrollFrame = CreateFrame("ScrollFrame", "RaidMailerRecipientsScrollFrame", recipientsBorder, "UIPanelScrollFrameTemplate")
+    recipientsScrollFrame:SetPoint("TOPLEFT", 7, -7)
+    recipientsScrollFrame:SetPoint("BOTTOMRIGHT", -28, 7)
+
+    recipientsEdit = CreateFrame("EditBox", nil, recipientsScrollFrame)
+    recipientsEdit:SetMultiLine(true)
+    recipientsEdit:SetAutoFocus(false)
+    recipientsEdit:SetFontObject(ChatFontNormal)
+    recipientsEdit:SetWidth(280)
+    recipientsEdit:SetHeight(236)
+    recipientsEdit:SetJustifyH("LEFT")
+    recipientsEdit:SetJustifyV("TOP")
+    recipientsEdit:SetMaxLetters(8192)
+    recipientsEdit:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+    recipientsEdit:SetScript("OnTextChanged", function()
+        UpdateRecipientEditHeight()
+        if UpdatePanel then UpdatePanel() end
+    end)
+    recipientsScrollFrame:SetScrollChild(recipientsEdit)
+
+    configSaveButton = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+    configSaveButton:SetSize(82, 23)
+    configSaveButton:SetPoint("TOPRIGHT", recipientsBorder, "BOTTOMRIGHT", 0, -8)
+    configSaveButton:SetText("Save")
+    configSaveButton:SetScript("OnClick", SaveDistributionConfigFromUI)
+
+    configRevertButton = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+    configRevertButton:SetSize(82, 23)
+    configRevertButton:SetPoint("RIGHT", configSaveButton, "LEFT", -8, 0)
+    configRevertButton:SetText("Revert")
+    configRevertButton:SetScript("OnClick", LoadConfigIntoPanelFields)
+
+    local separator = panel:CreateTexture(nil, "ARTWORK")
+    separator:SetColorTexture(0.35, 0.35, 0.35, 0.7)
+    separator:SetPoint("TOPLEFT", 14, -407)
+    separator:SetPoint("TOPRIGHT", -14, -407)
+    separator:SetHeight(1)
+
     statusText = panel:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    statusText:SetPoint("TOPLEFT", 12, -38)
-    statusText:SetPoint("TOPRIGHT", -12, -38)
+    statusText:SetPoint("TOPLEFT", 16, -421)
+    statusText:SetPoint("TOPRIGHT", -16, -421)
     statusText:SetJustifyH("LEFT")
 
     detailText = panel:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
@@ -1003,15 +1447,15 @@ local function CreatePanel()
     detailText:SetWordWrap(true)
 
     sendButton = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
-    sendButton:SetSize(145, 24)
-    sendButton:SetPoint("BOTTOMLEFT", 12, 12)
+    sendButton:SetSize(210, 25)
+    sendButton:SetPoint("BOTTOMLEFT", 14, 14)
     sendButton:SetScript("OnClick", function()
         if state.running then return end
         StartOrResume()
     end)
 
     cancelButton = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
-    cancelButton:SetSize(78, 24)
+    cancelButton:SetSize(104, 25)
     cancelButton:SetPoint("LEFT", sendButton, "RIGHT", 8, 0)
     cancelButton:SetText("Cancel")
     cancelButton:SetScript("OnClick", function()
@@ -1023,6 +1467,7 @@ local function CreatePanel()
     end)
     cancelButton:Disable()
 
+    LoadConfigIntoPanelFields()
     UpdatePanel()
 end
 
@@ -1062,7 +1507,10 @@ frame:SetScript("OnEvent", function(_, event, ...)
     if event == "ADDON_LOADED" then
         local loadedAddon = ...
         if loadedAddon == ADDON_NAME then
-            EnsureDB()
+            local migrated = EnsureDatabases()
+            if migrated then
+                Print("Imported legacy RaidMailerConfig.lua values into the new in-game SavedVariables configuration.")
+            end
         end
 
     elseif event == "MAIL_SHOW" then
@@ -1070,6 +1518,7 @@ frame:SetScript("OnEvent", function(_, event, ...)
         UpdatePanel()
 
     elseif event == "MAIL_CLOSED" or event == "PLAYER_ENTERING_WORLD" then
+        if settingsFrame and event == "MAIL_CLOSED" then settingsFrame:Hide() end
         if state.running then
             state.generation = state.generation + 1
             state.running = false
@@ -1087,6 +1536,7 @@ frame:SetScript("OnEvent", function(_, event, ...)
             state.mailRetryCount = 0
             state.currentRecipient = nil
             state.itemID = nil
+            state.quantity = nil
             state.cancelRequested = false
             Print("Paused because the mailbox is no longer open. Reopen a mailbox and use Resume to continue.")
         end
@@ -1187,18 +1637,20 @@ SlashCmdList.RAIDMAILER = function(msg)
         ResetSavedRun()
     elseif msg == "cancel" or msg == "stop" then
         CancelRun()
+    elseif msg == "settings" then
+        ShowSettingsWindow()
     else
         local savedJob = GetSavedJob()
         if savedJob then
             local total = #savedJob.recipients
             local sent = savedJob.nextIndex - 1
             local remaining = total - sent
-            Print(string.format("Saved batch: %s. %d/%d sent, %d remaining. Next: %s.", GetItemNameByID(savedJob.itemID), sent, total, remaining, savedJob.recipients[savedJob.nextIndex]))
-            Print("Commands: /rm resume, /rm restart, /rm reset, /rm cancel")
+            Print(string.format("Saved batch: %s, %d per mail. %d/%d sent, %d remaining. Next: %s.", GetItemNameByID(savedJob.itemID), savedJob.quantity, sent, total, remaining, savedJob.recipients[savedJob.nextIndex]))
+            Print("Commands: /rm resume, /rm restart, /rm reset, /rm cancel, /rm settings")
         else
             local recipients, duplicates, skippedSelf = ParseRecipients()
-            Print(string.format("Item: %s. %d recipient(s), %d in bags, %d duplicate(s), %d self entry/entries skipped.", GetConfiguredItemName(), #recipients, CountConfiguredItemsInBags(), #duplicates, skippedSelf))
-            Print("Open a mailbox, select the Send Mail tab, and use the RaidMailer panel. Commands: /rm send, /rm resume, /rm restart, /rm reset, /rm cancel")
+            Print(string.format("Item: %s. Quantity/mail: %d. %d recipient(s), %d in bags, %d duplicate(s), %d self entry/entries skipped.", GetConfiguredItemName(), GetConfiguredQuantity(), #recipients, CountConfiguredItemsInBags(), #duplicates, skippedSelf))
+            Print("Open a mailbox and select the Send Mail tab to edit the distribution list. Commands: /rm send, /rm settings")
         end
     end
 end
