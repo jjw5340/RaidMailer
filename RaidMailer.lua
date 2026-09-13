@@ -3,11 +3,12 @@ local ADDON_NAME = ...
 local BODY = ""
 local DEFAULT_NEXT_MAIL_DELAY = 1.00
 local DEFAULT_PANEL_OFFSET_X = 8
-local DEFAULT_PANEL_OFFSET_Y = -32
+local DEFAULT_PANEL_OFFSET_Y = 1
 local DEFAULT_QUANTITY = 1
 local PANEL_WIDTH = 350
-local FALLBACK_PANEL_HEIGHT = 512
-local RECIPIENTS_VISIBLE_HEIGHT = 154
+local PANEL_HEIGHT_CORRECTION = 2
+local PANEL_HEIGHT_FALLBACK = 424
+local RECIPIENTS_VISIBLE_HEIGHT = 159
 local RECIPIENTS_EDIT_MIN_HEIGHT = 145
 local ATTACHMENT_SETTLE_DELAY = 0.35
 local MAIL_CLEAR_TIMEOUT = 12.0
@@ -467,9 +468,9 @@ local function ApplyPanelPosition()
     if not panel or not MailFrame then return end
     local mailFrameHeight = MailFrame:GetHeight()
     if mailFrameHeight and mailFrameHeight > 0 then
-        panel:SetHeight(mailFrameHeight)
+        panel:SetHeight(mailFrameHeight + PANEL_HEIGHT_CORRECTION)
     else
-        panel:SetHeight(FALLBACK_PANEL_HEIGHT)
+        panel:SetHeight(PANEL_HEIGHT_FALLBACK + PANEL_HEIGHT_CORRECTION)
     end
     panel:ClearAllPoints()
     panel:SetPoint("TOPLEFT", MailFrame, "TOPRIGHT", GetPanelOffsetX(), GetPanelOffsetY())
@@ -1325,7 +1326,7 @@ local function CreatePanel()
     if panel or not SendMailFrame then return end
 
     panel = CreateFrame("Frame", "RaidMailerPanel", SendMailFrame, "BackdropTemplate")
-    panel:SetSize(PANEL_WIDTH, (MailFrame and MailFrame:GetHeight()) or FALLBACK_PANEL_HEIGHT)
+    panel:SetSize(PANEL_WIDTH, ((MailFrame and MailFrame:GetHeight()) or PANEL_HEIGHT_FALLBACK) + PANEL_HEIGHT_CORRECTION)
     ApplyPanelPosition()
     panel:SetBackdrop({
         bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
